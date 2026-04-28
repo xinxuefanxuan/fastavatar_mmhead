@@ -66,13 +66,13 @@ dataset:
     meta_path: "./datasets/mixed_uids.json"
     datasets:
         nersemble:
-            root_dir: YOUR_DATA_PATH
+            root_dir: "/ssd_data/sjd/data/nersemble_fastavatar_unified_full"
             task_type: "unified"
-            val_id: [] # '309', '146', '123', '370', '204'
-        vfhq:
-            root_dir: YOUR_DATA_PATH
-            task_type: "monocular"
-            val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
+            val_id: ['089','090'] # '309', '146', '123', '370', '204'
+        # vfhq:
+        #     root_dir: YOUR_DATA_PATH
+        #     task_type: "monocular"
+        #     val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
 
 train:
     gradient_checkpointing: true

@@ -3,3 +3,60 @@ model_zoo/
 assets/sample_input/
 assets/sample_motion/
 __pycache__/
+# large local files
+data/
+model_zoo/
+exps/
+outputs/
+checkpoints/
+runs/
+wandb/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.pkl
+*.npy
+*.npz
+*.mp4
+*.avi
+*.zip
+*.tar
+*.tar.gz
+
+# local third-party source/build folders
+diff-gaussian-rasterization/
+nvdiffrast/
+pytorch3d/
+simple-knn/
+
+# local datasets and outputs
+datasets/
+data/
+model_zoo/
+exps/
+outputs/
+checkpoints/
+runs/
+wandb/
+
+# compiled files
+*.o
+*.so
+*.pyc
+__pycache__/
+build/
+
+# large model/data files
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.pkl
+*.npy
+*.npz
+*.mp4
+*.avi
+*.zip
+*.tar
+*.tar.gz
