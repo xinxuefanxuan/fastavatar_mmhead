@@ -1,0 +1,47 @@
+prompt_to_primitive:
+  neutral: neutral
+  turn head left: turn_head_left
+  turn head right: turn_head_right
+  nod: nod
+  open mouth: open_mouth
+  smile slightly: smile_from_exemplar_delta
+  smile strongly: smile_from_exemplar_delta
+  blink once: blink_once
+
+# Field mapping must match real motion npz keys in your repository data.
+# Set these after running inspect_motion_format.py
+field_mapping:
+  head_pose_field: rotation
+  jaw_pose_field: jaw_pose
+  expression_field: expr
+
+# Primitive parameters
+primitive_params:
+  turn_head_left:
+    yaw_index: 1
+    amplitude: 0.20
+  turn_head_right:
+    yaw_index: 1
+    amplitude: 0.20
+  nod:
+    pitch_index: 0
+    amplitude: 0.15
+    cycles: 1.5
+  open_mouth:
+    jaw_index: 0
+    amplitude: 0.25
+  smile_slightly:
+    alpha: 0.35
+  smile_strongly:
+    alpha: 0.80
+  blink_once:
+    amplitude: 0.6
+    width: 8
+
+# Exemplar slices for delta-based expression editing
+# inclusive start, exclusive end
+smile_exemplar:
+  neutral_start: 0
+  neutral_end: 10
+  smile_start: 30
+  smile_end: 45
