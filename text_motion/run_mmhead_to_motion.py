@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 import shutil
 from pathlib import Path
 from typing import Dict, Tuple
@@ -250,23 +251,81 @@ def write_updates_back(
             payload[k] = arr[i]
 
 
+def _to_2d_float32(arr: np.ndarray, name: str) -> np.ndarray:
+    a = np.asarray(arr, dtype=np.float32)
+    if a.ndim == 1:
+        a = a[:, None]
+    elif a.ndim > 2:
+        a = a.reshape(a.shape[0], -1)
+    if a.ndim != 2:
+        raise ValueError(f"{name} must be 2D after reshape, got {a.shape}")
+    return a
+
+
 def load_mmhead_npz(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    data = np.load(path, allow_pickle=True)
+    if path.suffix.lower() == ".pkl":
+        with path.open("rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError(f"PKL motion must be dict-like, got {type(obj)}")
 
-    required = ["expression", "head_pose", "jaw_pose"]
-    for k in required:
-        if k not in data.files:
-            raise KeyError(f"{path} missing required key: {k}. keys={data.files}")
+        # normalized pkl schema fallback
+        if all(k in obj for k in ("expression", "head_pose", "jaw_pose")):
+            expr = _to_2d_float32(obj["expression"], "expression")
+            head = _to_2d_float32(obj["head_pose"], "head_pose")
+            jaw = _to_2d_float32(obj["jaw_pose"], "jaw_pose")
+            print("[MMHead normalized pkl]")
+            print(f"  expression: {expr.shape}")
+            print(f"  head_pose:  {head.shape}")
+            print(f"  jaw_pose:   {jaw.shape}")
+        elif "expcodes" in obj and "posecodes" in obj:
+            expr = _to_2d_float32(obj["expcodes"], "expcodes")
+            pose = _to_2d_float32(obj["posecodes"], "posecodes")
+            if pose.shape[1] >= 6:
+                head = pose[:, 0:3].astype(np.float32, copy=False)
+                jaw = pose[:, 3:6].astype(np.float32, copy=False)
+                print("[MMHead native pkl]")
+                print(f"  expcodes -> expression: {expr.shape}")
+                print(f"  posecodes[:, 0:3] -> head_pose: {head.shape}")
+                print(f"  posecodes[:, 3:6] -> jaw_pose:  {jaw.shape}")
+            elif pose.shape[1] == 3:
+                head = pose[:, 0:3].astype(np.float32, copy=False)
+                jaw = np.zeros_like(head, dtype=np.float32)
+                print("[MMHead native pkl]")
+                print(f"  expcodes -> expression: {expr.shape}")
+                print(f"  posecodes[:, 0:3] -> head_pose: {head.shape}")
+                print(f"  [WARN] posecodes has only 3 channels; jaw_pose is zeros: {jaw.shape}")
+            else:
+                raise ValueError(
+                    f"posecodes must have at least 3 channels, got shape={pose.shape}"
+                )
+        else:
+            raise KeyError(
+                f"{path} unsupported pkl keys. expected normalized keys "
+                f"(expression/head_pose/jaw_pose) or native keys (expcodes/posecodes). "
+                f"keys={list(obj.keys())}"
+            )
+    else:
+        data = np.load(path, allow_pickle=True)
 
-    expr = np.asarray(data["expression"], dtype=np.float32)
-    head = np.asarray(data["head_pose"], dtype=np.float32)
-    jaw = np.asarray(data["jaw_pose"], dtype=np.float32)
+        required = ["expression", "head_pose", "jaw_pose"]
+        for k in required:
+            if k not in data.files:
+                raise KeyError(f"{path} missing required key: {k}. keys={data.files}")
 
-    if expr.ndim != 2 or expr.shape[1] != 50:
+        expr = np.asarray(data["expression"], dtype=np.float32)
+        head = np.asarray(data["head_pose"], dtype=np.float32)
+        jaw = np.asarray(data["jaw_pose"], dtype=np.float32)
+
+    expr = _to_2d_float32(expr, "expression")
+    head = _to_2d_float32(head, "head_pose")
+    jaw = _to_2d_float32(jaw, "jaw_pose")
+
+    if expr.shape[1] != 50:
         raise ValueError(f"Bad expression shape: {expr.shape}, expected (T,50)")
-    if head.ndim != 2 or head.shape[1] != 3:
+    if head.shape[1] != 3:
         raise ValueError(f"Bad head_pose shape: {head.shape}, expected (T,3)")
-    if jaw.ndim != 2 or jaw.shape[1] != 3:
+    if jaw.shape[1] != 3:
         raise ValueError(f"Bad jaw_pose shape: {jaw.shape}, expected (T,3)")
 
     return expr, head, jaw
