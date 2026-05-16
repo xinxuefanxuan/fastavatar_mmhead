@@ -35,6 +35,10 @@ def main() -> None:
     ap.add_argument("--jaw_axis_order", type=str, default="0,1,2")
     ap.add_argument("--jaw_axis_signs", type=str, default="1,1,1")
     ap.add_argument("--primitive_config", type=Path, default=Path("text_motion/primitives.yaml"))
+    ap.add_argument("--expr_smooth_window", type=int, default=1)
+    ap.add_argument("--head_smooth_window", type=int, default=1)
+    ap.add_argument("--jaw_smooth_window", type=int, default=1)
+    ap.add_argument("--head_max_step", type=float, default=0.0)
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
 
@@ -79,6 +83,10 @@ def main() -> None:
         "--jaw_axis_order", args.jaw_axis_order,
         "--jaw_axis_signs", args.jaw_axis_signs,
         "--primitive_config", str(args.primitive_config),
+        "--expr_smooth_window", str(args.expr_smooth_window),
+        "--head_smooth_window", str(args.head_smooth_window),
+        "--jaw_smooth_window", str(args.jaw_smooth_window),
+        "--head_max_step", str(args.head_max_step),
     ]
     if args.dry_run:
         cmd.append("--dry_run")

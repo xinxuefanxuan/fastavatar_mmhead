@@ -185,3 +185,25 @@ bash scripts/infer/infer.sh \
 - 无聚类/码本压缩（每个样本即一个 codebook entry）。
 - 运动方向统计是粗粒度（基于 delta norm）。
 - 文本匹配不保证视觉上完全一致，仅提供可解释、可复现的第一版检索基线。
+
+### 7.8 头部抖动稳定化建议（MMHead native posecodes）
+
+如果检索到的样本在 `head_pose` 上出现抖动，可在转换时启用平滑与速度钳制：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion_stable \
+  --top_k 10 \
+  --rank_index 0 \
+  --head_smooth_window 9 \
+  --head_max_step 0.03 \
+  --head_scale 0.05
+```
+
+说明：
+- `*_smooth_window > 1` 时，按时间维做中心滑动平均（边界用 edge padding）。
+- `head_max_step > 0` 时，会对帧间头部步长做范数钳制并重建轨迹。
+- 默认参数（window=1, max_step=0）保持旧行为不变。

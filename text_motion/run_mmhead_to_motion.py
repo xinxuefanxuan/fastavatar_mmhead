@@ -114,6 +114,48 @@ def resample_to_length(x: np.ndarray, target_t: int) -> np.ndarray:
     return out
 
 
+
+
+def smooth_sequence_centered(x: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return x
+    if x.ndim != 2:
+        raise ValueError(f"smooth_sequence_centered expects (T,D), got {x.shape}")
+    w = int(window)
+    if w < 1:
+        return x
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    xpad = np.pad(x, ((pad, pad), (0, 0)), mode="edge")
+    out = np.zeros_like(x)
+    for t in range(x.shape[0]):
+        out[t] = xpad[t:t+w].mean(axis=0)
+    return out
+
+
+def clamp_head_velocity(x: np.ndarray, max_step: float) -> tuple[np.ndarray, float, float]:
+    if max_step <= 0:
+        return x, 0.0, 0.0
+    if x.ndim != 2 or x.shape[0] <= 1:
+        return x, 0.0, 0.0
+    diffs = x[1:] - x[:-1]
+    norms = np.linalg.norm(diffs, axis=1)
+    before = float(norms.max()) if norms.size else 0.0
+
+    out = x.copy()
+    for i in range(1, x.shape[0]):
+        step = out[i] - out[i-1]
+        n = float(np.linalg.norm(step))
+        if n > max_step and n > 1e-12:
+            step = step * (max_step / n)
+            out[i] = out[i-1] + step
+
+    diffs2 = out[1:] - out[:-1]
+    norms2 = np.linalg.norm(diffs2, axis=1)
+    after = float(norms2.max()) if norms2.size else 0.0
+    return out, before, after
+
 def apply_axis_transform(x: np.ndarray, order: list[int], signs: list[float]) -> np.ndarray:
     """
     x: (T,3)
@@ -354,6 +396,10 @@ def apply_mmhead_motion_to_sequence(
     head_axis_signs: list[float],
     jaw_axis_order: list[int],
     jaw_axis_signs: list[float],
+    expr_smooth_window: int,
+    head_smooth_window: int,
+    jaw_smooth_window: int,
+    head_max_step: float,
     dry_run: bool,
 ) -> None:
     fields = cfg.get("field_mapping", {})
@@ -385,6 +431,23 @@ def apply_mmhead_motion_to_sequence(
 
     mm_head = apply_axis_transform(mm_head, head_axis_order, head_axis_signs)
     mm_jaw = apply_axis_transform(mm_jaw, jaw_axis_order, jaw_axis_signs)
+
+    if int(expr_smooth_window) > 1:
+        print(f"[Smoothing] expr window={expr_smooth_window}")
+        mm_expr = smooth_sequence_centered(mm_expr, int(expr_smooth_window))
+    if int(head_smooth_window) > 1:
+        print(f"[Smoothing] head window={head_smooth_window}")
+        mm_head = smooth_sequence_centered(mm_head, int(head_smooth_window))
+    if int(jaw_smooth_window) > 1:
+        print(f"[Smoothing] jaw window={jaw_smooth_window}")
+        mm_jaw = smooth_sequence_centered(mm_jaw, int(jaw_smooth_window))
+
+    if float(head_max_step) > 0.0:
+        mm_head, v_before, v_after = clamp_head_velocity(mm_head, float(head_max_step))
+        print(
+            f"[Head clamp] max_step={head_max_step}, "
+            f"before max velocity={v_before:.6f}, after max velocity={v_after:.6f}"
+        )
 
     n = min(int(num_frames), len(frame_payloads))
     print(f"[MMHead source] {mmhead_npz}")
@@ -457,6 +520,11 @@ def main() -> None:
     ap.add_argument("--jaw_axis_order", type=str, default="0,1,2")
     ap.add_argument("--jaw_axis_signs", type=str, default="1,1,1")
 
+    ap.add_argument("--expr_smooth_window", type=int, default=1)
+    ap.add_argument("--head_smooth_window", type=int, default=1)
+    ap.add_argument("--jaw_smooth_window", type=int, default=1)
+    ap.add_argument("--head_max_step", type=float, default=0.0)
+
     ap.add_argument("--primitive_config", type=Path, default=Path("text_motion/primitives.yaml"))
     ap.add_argument("--dry_run", action="store_true")
 
@@ -495,6 +563,10 @@ def main() -> None:
         head_axis_signs=parse_float_list(args.head_axis_signs),
         jaw_axis_order=parse_int_list(args.jaw_axis_order),
         jaw_axis_signs=parse_float_list(args.jaw_axis_signs),
+        expr_smooth_window=args.expr_smooth_window,
+        head_smooth_window=args.head_smooth_window,
+        jaw_smooth_window=args.jaw_smooth_window,
+        head_max_step=args.head_max_step,
         dry_run=args.dry_run,
     )
 
