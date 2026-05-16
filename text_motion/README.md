@@ -10,6 +10,7 @@ python text_motion/inspect_motion_format.py \
 ```
 
 输出包括：
+
 - 目录树（深度 3）
 - 首帧 npz 信息（key/shape/dtype/min/max/mean）
 - transforms.json 顶层与 frame schema
