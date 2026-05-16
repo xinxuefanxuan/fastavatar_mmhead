@@ -72,3 +72,116 @@ python text_motion/run_text_to_motion.py \
 - `motion_primitives.py`：时序曲线 + 原语实现
 - `run_text_to_motion.py`：主入口
 - `primitives.yaml`：受控 prompt 映射与参数
+
+## 7) 检索式 Text-to-MMHead 代码本（第一版）
+
+第一版目标：给定文本 prompt，从 MMHead 样本中做关键词检索，选出 top-k（默认取 top-1），再复用 `run_mmhead_to_motion.py` 完成 FastAvatar 可读 motion 序列生成。
+
+### 数据假设
+
+MMHead 根目录下可包含：
+
+- `t2m_manifest.jsonl`
+- `facial_motion/{sample_id}.pkl`（主格式）
+- `facial_motion/{sample_id}.npz`（可选 fallback）
+- `text_annotations/action/{sample_id}.txt`
+- `text_annotations/detail_expression/{sample_id}.txt`
+- `text_annotations/detail_head_pose/{sample_id}.txt`
+- `text_annotations/emotion/{sample_id}.txt`
+- `text_annotations/emotion_scenario/{sample_id}.txt`
+
+### 7.1 构建 codebook
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl outputs/codebook.jsonl
+```
+
+可选调试：
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl outputs/codebook_debug.jsonl \
+  --max_samples 20 \
+  --verbose
+```
+
+### 7.2 检查 codebook
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+p=Path('outputs/codebook.jsonl')
+for i,l in enumerate(p.open('r',encoding='utf-8')):
+    if i>=3: break
+    print(json.loads(l))
+PY
+```
+
+### 7.3 关键词检索 top-k
+
+```bash
+python text_motion/mmhead_retrieval.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook_debug.jsonl \
+  --top_k 5 \
+  --output_jsonl outputs/retrieval_debug.jsonl
+```
+
+### 7.4 文本到 FastAvatar motion（检索+转换）
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook_debug.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion_debug \
+  --top_k 5 \
+  --rank_index 0 \
+  --dry_run
+```
+
+支持保存检索结果与元数据：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion \
+  --top_k 10 \
+  --rank_index 0 \
+  --save_retrieval_jsonl assets/sample_motion/text_retrieved_motion/retrieval_topk.jsonl \
+  --save_metadata_json assets/sample_motion/text_retrieved_motion/retrieval_meta.json
+```
+
+### 7.5 用 infer.sh 渲染
+
+检索转换完成后，沿用你已有推理入口：
+
+```bash
+bash scripts/infer/infer.sh \
+  configs/inference/infer.yaml \
+  model_zoo/fastavatar/ \
+  assets/sample_input/mono_video/nersemble_seq_214.mp4 \
+  assets/sample_motion/text_retrieved_motion/
+```
+
+### 7.6 输出验证建议
+
+- `codebook.jsonl` 每行一个样本，包含 `searchable_text`、`annotations`、`motion_stats`。
+- `retrieval_topk.jsonl` 包含排序、匹配词、分数分解。
+- `retrieval_meta.json` 记录 prompt、选中样本、命令行参数和时间戳。
+- `output_motion` 目录结构应保持与模板兼容（含 `transforms.json` 与 `flame_param/*.npz`）。
+
+### 7.7 已知限制（第一版）
+
+- 仅关键词检索（无 embedding、无 FAISS）。
+- 无聚类/码本压缩（每个样本即一个 codebook entry）。
+- 运动方向统计是粗粒度（基于 delta norm）。
+- 文本匹配不保证视觉上完全一致，仅提供可解释、可复现的第一版检索基线。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 import shutil
 from pathlib import Path
 from typing import Dict, Tuple
@@ -251,16 +252,29 @@ def write_updates_back(
 
 
 def load_mmhead_npz(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    data = np.load(path, allow_pickle=True)
+    if path.suffix.lower() == ".pkl":
+        with path.open("rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError(f"PKL motion must be dict-like, got {type(obj)}")
+        required = ["expression", "head_pose", "jaw_pose"]
+        for k in required:
+            if k not in obj:
+                raise KeyError(f"{path} missing required key: {k}. keys={list(obj.keys())}")
+        expr = np.asarray(obj["expression"], dtype=np.float32)
+        head = np.asarray(obj["head_pose"], dtype=np.float32)
+        jaw = np.asarray(obj["jaw_pose"], dtype=np.float32)
+    else:
+        data = np.load(path, allow_pickle=True)
 
-    required = ["expression", "head_pose", "jaw_pose"]
-    for k in required:
-        if k not in data.files:
-            raise KeyError(f"{path} missing required key: {k}. keys={data.files}")
+        required = ["expression", "head_pose", "jaw_pose"]
+        for k in required:
+            if k not in data.files:
+                raise KeyError(f"{path} missing required key: {k}. keys={data.files}")
 
-    expr = np.asarray(data["expression"], dtype=np.float32)
-    head = np.asarray(data["head_pose"], dtype=np.float32)
-    jaw = np.asarray(data["jaw_pose"], dtype=np.float32)
+        expr = np.asarray(data["expression"], dtype=np.float32)
+        head = np.asarray(data["head_pose"], dtype=np.float32)
+        jaw = np.asarray(data["jaw_pose"], dtype=np.float32)
 
     if expr.ndim != 2 or expr.shape[1] != 50:
         raise ValueError(f"Bad expression shape: {expr.shape}, expected (T,50)")
