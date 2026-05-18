@@ -33,6 +33,38 @@ def apply_seq(payloads, key, seq):
         p[key] = seq[i]
 
 
+
+
+def apply_delta_to_field(payloads, key, delta, scale, num_frames, channel_name):
+    base = np.stack([np.asarray(p[key], dtype=np.float32) for p in payloads], axis=0)
+    orig_shape = base.shape
+    if base.ndim < 2:
+        raise ValueError(f"{key} must be at least 2D with time axis, got {orig_shape}")
+    T = base.shape[0]
+    base2d = base.reshape(T, -1)
+
+    d = np.asarray(delta, dtype=np.float32)
+    if d.ndim != 2:
+        d = d.reshape(d.shape[0], -1)
+
+    n = min(int(num_frames), T, d.shape[0])
+    edit_dim = min(base2d.shape[1], d.shape[1])
+    if base2d.shape[1] != d.shape[1]:
+        print(
+            f"[WARN] {channel_name} dimension mismatch: "
+            f"target_dim={base2d.shape[1]}, source_dim={d.shape[1]}. "
+            f"Editing first {edit_dim} channels only."
+        )
+
+    print(f"[Compose] field={key}, target_shape={orig_shape}, delta_shape={d.shape}, edit_dim={edit_dim}")
+    out = base2d.copy()
+    out[:n, :edit_dim] = out[:n, :edit_dim] + float(scale) * d[:n, :edit_dim]
+    out = out.reshape(orig_shape).astype(np.float32)
+    print(f"[Compose] field={key}, final_shape={out.shape}")
+
+    for i, p in enumerate(payloads):
+        p[key] = out[i]
+
 def resample_or_repeat(x, target_t):
     x = np.asarray(x, dtype=np.float32)
     if x.shape[0] == target_t:
@@ -95,27 +127,20 @@ def main():
         mm_expr, _, _ = load_mmhead_npz(Path(expr_rows[args.expr_rank_index]['motion_path']))
         if args.expr_smooth_window > 1: mm_expr = smooth_sequence_centered(mm_expr, args.expr_smooth_window)
         delta = delta_from_source(mm_expr, n, args.ref_n)
-        base = seq_from_payloads(payloads, 'expr').astype(np.float32)
-        base[:n] = base[:n] + args.expr_scale * delta
-        apply_seq(payloads, 'expr', base)
+        apply_delta_to_field(payloads, 'expr', delta, args.expr_scale, n, 'expr')
 
     if intents['need_head'] and head_rows:
         _, mm_head, _ = load_mmhead_npz(Path(head_rows[args.head_rank_index]['motion_path']))
         if args.head_smooth_window > 1: mm_head = smooth_sequence_centered(mm_head, args.head_smooth_window)
         if args.head_max_step > 0: mm_head,_,_ = clamp_head_velocity(mm_head, args.head_max_step)
         delta = delta_from_source(mm_head, n, args.ref_n)
-        base = seq_from_payloads(payloads, args.head_target_field).astype(np.float32)
-        c = min(base.shape[-1], delta.shape[-1])
-        base[:n,:c] = base[:n,:c] + args.head_scale * delta[:,:c]
-        apply_seq(payloads, args.head_target_field, base)
+        apply_delta_to_field(payloads, args.head_target_field, delta, args.head_scale, n, 'head')
 
     if intents['need_jaw'] and jaw_rows:
         _, _, mm_jaw = load_mmhead_npz(Path(jaw_rows[args.jaw_rank_index]['motion_path']))
         if args.jaw_smooth_window > 1: mm_jaw = smooth_sequence_centered(mm_jaw, args.jaw_smooth_window)
         delta = delta_from_source(mm_jaw, n, args.ref_n)
-        base = seq_from_payloads(payloads, 'jaw_pose').astype(np.float32)
-        base[:n] = base[:n] + args.jaw_scale * delta
-        apply_seq(payloads, 'jaw_pose', base)
+        apply_delta_to_field(payloads, 'jaw_pose', delta, args.jaw_scale, n, 'jaw')
 
     for p,pl in zip(frames,payloads):
         np.savez(p, **pl)

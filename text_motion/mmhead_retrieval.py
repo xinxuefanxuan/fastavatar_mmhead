@@ -22,6 +22,14 @@ SYNONYMS = {
 PHRASE_BONUS_TABLE = {"turn head left": 2.5, "turn head right": 2.5, "look left": 2.0, "look right": 2.0, "look up": 2.0, "look down": 2.0, "open mouth": 2.0, "close eyes": 2.0, "smile": 1.2, "angry": 1.2, "surprised": 1.2, "sad": 1.2}
 
 
+SMILE_TERMS = {"smile", "smiling", "happy", "grin"}
+EXPR_NEGATIVE_TERMS = ["blink", "kiss", "suck cheeks", "hide lips", "eyes wide", "lower eyebrows"]
+
+
+def contains_any_phrase(text: str, phrases) -> bool:
+    return any(p in text for p in phrases)
+
+
 def normalize_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
@@ -86,11 +94,24 @@ def score_entry(entry: dict, prompt: str, channel: str = "all") -> dict:
         jitter_penalty = 1.0 * head_vel
         total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
     elif channel == "expr":
-        motion_reward = 1.5 * expr
-        purity_reward = 1.0 * expr_purity
-        cross_penalty = 0.5 * head
-        jitter_penalty = 0.1 * head_vel
-        total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
+        searchable_norm = normalize_text(entry.get("searchable_text", ""))
+        prompt_norm = normalize_text(prompt)
+        prompt_tokens = set(tokenize(prompt_norm))
+
+        smile_boost = 0.0
+        if prompt_tokens.intersection(SMILE_TERMS) and contains_any_phrase(searchable_norm, SMILE_TERMS):
+            smile_boost = 4.0
+
+        unrelated_penalty = 0.0
+        for neg in EXPR_NEGATIVE_TERMS:
+            if neg in searchable_norm and neg not in prompt_norm:
+                unrelated_penalty += 1.0
+
+        motion_reward = 1.0 * min(expr, 5.0)
+        purity_reward = 1.0 * min(expr_purity, 5.0)
+        cross_penalty = 0.6 * head + 0.1 * jaw
+        jitter_penalty = 0.1 * head_vel + unrelated_penalty
+        total = (2.0 * text_score) + smile_boost + motion_reward + purity_reward - cross_penalty - jitter_penalty
     elif channel == "jaw":
         motion_reward = 2.0 * jaw
         purity_reward = 1.0 * jaw_purity
