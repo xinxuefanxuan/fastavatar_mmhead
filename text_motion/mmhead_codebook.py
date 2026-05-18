@@ -127,6 +127,28 @@ def _delta_stats(arr: Any) -> Dict[str, float]:
     }
 
 
+
+
+def _velocity_stats(arr: Any) -> Dict[str, float]:
+    np = _require_numpy()
+    if arr.shape[0] < 2:
+        return {"mean": 0.0, "max": 0.0}
+    vel = arr[1:] - arr[:-1]
+    norms = np.linalg.norm(vel, axis=1)
+    return {"mean": float(np.mean(norms)), "max": float(np.max(norms))}
+
+
+def _extract_components_from_motion(motion_obj: Any) -> tuple[Any, Any, Any]:
+    np = _require_numpy()
+    if isinstance(motion_obj, dict) and "expcodes" in motion_obj and "posecodes" in motion_obj:
+        expr = _reshape_to_td(motion_obj["expcodes"])
+        pose = _reshape_to_td(motion_obj["posecodes"])
+        head = pose[:, 0:3] if pose.shape[1] >= 3 else None
+        jaw = pose[:, 3:6] if pose.shape[1] >= 6 else None
+        return expr, head, jaw
+    arrays = _collect_arrays(motion_obj)
+    return _find_component(arrays, EXPR_KEYS), _find_component(arrays, HEAD_KEYS), _find_component(arrays, JAW_KEYS)
+
 def load_motion(path: Path) -> Any:
     np = _require_numpy()
     if path.suffix.lower() == ".pkl":
@@ -140,10 +162,7 @@ def load_motion(path: Path) -> Any:
 
 def compute_motion_stats(motion_obj: Any, sample_id: str) -> Tuple[Dict[str, float], bool, int]:
     np = _require_numpy()
-    arrays = _collect_arrays(motion_obj)
-    expr = _find_component(arrays, EXPR_KEYS)
-    jaw = _find_component(arrays, JAW_KEYS)
-    head = _find_component(arrays, HEAD_KEYS)
+    expr, head, jaw = _extract_components_from_motion(motion_obj)
 
     stats_valid = True
 
@@ -173,6 +192,15 @@ def compute_motion_stats(motion_obj: Any, sample_id: str) -> Tuple[Dict[str, flo
 
     intensity = 0.5 * expr_stats["max"] + 0.3 * head_stats["max"] + 0.2 * jaw_stats["max"]
 
+    expr_vel = _velocity_stats(expr) if expr is not None else {"mean": 0.0, "max": 0.0}
+    head_vel = _velocity_stats(head) if head is not None else {"mean": 0.0, "max": 0.0}
+    jaw_vel = _velocity_stats(jaw) if jaw is not None else {"mean": 0.0, "max": 0.0}
+
+    eps = 1e-6
+    head_purity = float(head_stats["max"] / (expr_stats["max"] + jaw_stats["max"] + eps))
+    expr_purity = float(expr_stats["max"] / (head_stats["max"] + jaw_stats["max"] + eps))
+    jaw_purity = float(jaw_stats["max"] / (head_stats["max"] + expr_stats["max"] + eps))
+
     stats = {
         "num_frames": num_frames,
         "expr_delta_mean_norm": expr_stats["mean"],
@@ -184,6 +212,15 @@ def compute_motion_stats(motion_obj: Any, sample_id: str) -> Tuple[Dict[str, flo
         "head_delta_mean_norm": head_stats["mean"],
         "head_delta_max_norm": head_stats["max"],
         "head_delta_std_norm": head_stats["std"],
+        "expr_velocity_mean_norm": expr_vel["mean"],
+        "expr_velocity_max_norm": expr_vel["max"],
+        "head_velocity_mean_norm": head_vel["mean"],
+        "head_velocity_max_norm": head_vel["max"],
+        "jaw_velocity_mean_norm": jaw_vel["mean"],
+        "jaw_velocity_max_norm": jaw_vel["max"],
+        "head_purity_score": head_purity,
+        "expr_purity_score": expr_purity,
+        "jaw_purity_score": jaw_purity,
         "motion_intensity_score": float(intensity),
     }
     return stats, stats_valid, num_frames

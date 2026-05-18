@@ -257,3 +257,58 @@ python text_motion/run_text_to_mmhead_motion.py \
   --jaw_smooth_window 3 \
   --head_max_step 0.03
 ```
+
+## 9) Channel-disentangled retrieval and composition
+
+动机：holistic 检索会把 head/expression/jaw 耦合迁移，容易出现语义混合。该流程按通道检索并在 neutral 模板上组合，控制更干净。
+
+### 9.1 刷新 codebook
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl "$OUT_DIR/codebook_full.jsonl"
+```
+
+### 9.2 先构建 neutral 模板
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --auto_neutral
+```
+
+### 9.3 通道组合生成动作
+
+```bash
+python text_motion/run_text_to_composed_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_composed_turn_left_smile \
+  --top_k 10 \
+  --head_scale 0.15 \
+  --expr_scale 0.12 \
+  --jaw_scale 0.2 \
+  --head_smooth_window 9 \
+  --head_max_step 0.03 \
+  --head_target_field neck_pose
+```
+
+### 9.4 推理
+
+```bash
+bash scripts/infer/infer.sh \
+  configs/inference/infer.yaml \
+  model_zoo/fastavatar/ \
+  assets/sample_input/mono_video/nersemble_seq_214.mp4 \
+  assets/sample_motion/text_composed_turn_left_smile/ \
+  16 \
+  16 \
+  Monocular \
+  false
+```
+
+注意：传给 `infer.sh` 的 motion 目录建议带 trailing slash（`.../`）。

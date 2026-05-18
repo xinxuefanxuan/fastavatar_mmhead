@@ -5,7 +5,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 SYNONYMS = {
     "left": ["left", "turn left", "look left", "head left"],
@@ -19,150 +19,106 @@ SYNONYMS = {
     "surprise": ["surprise", "surprised", "shocked"],
     "mouth": ["mouth", "open mouth", "jaw", "speaking", "talk"],
 }
-
-PHRASE_BONUS_TABLE = {
-    "turn head left": 2.5,
-    "turn head right": 2.5,
-    "look left": 2.0,
-    "look right": 2.0,
-    "look up": 2.0,
-    "look down": 2.0,
-    "open mouth": 2.0,
-    "close eyes": 2.0,
-    "smile": 1.2,
-    "angry": 1.2,
-    "surprised": 1.2,
-    "sad": 1.2,
-}
-
-HEAD_HINTS = {"head", "left", "right", "up", "down", "look", "turn", "pose"}
-EXPR_HINTS = {"smile", "laugh", "angry", "sad", "surprise", "expression", "face", "emotion"}
-JAW_HINTS = {"mouth", "jaw", "speaking", "talk", "open", "close"}
+PHRASE_BONUS_TABLE = {"turn head left": 2.5, "turn head right": 2.5, "look left": 2.0, "look right": 2.0, "look up": 2.0, "look down": 2.0, "open mouth": 2.0, "close eyes": 2.0, "smile": 1.2, "angry": 1.2, "surprised": 1.2, "sad": 1.2}
 
 
 def normalize_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def tokenize(text: str) -> List[str]:
-    norm = normalize_text(text)
-    return norm.split() if norm else []
+    n = normalize_text(text)
+    return n.split() if n else []
 
 
-def expand_prompt(prompt: str) -> Tuple[set[str], set[str], str]:
+def expand_prompt(prompt: str) -> Tuple[set[str], str]:
     norm = normalize_text(prompt)
     tokens = set(tokenize(prompt))
-    phrases = {norm}
     for canon, syns in SYNONYMS.items():
-        if canon in tokens:
+        if canon in tokens or any(normalize_text(s) in norm for s in syns):
             tokens.update(tokenize(" ".join(syns)))
-            phrases.update(normalize_text(s) for s in syns)
-            continue
-        for s in syns:
-            if normalize_text(s) in norm:
-                tokens.update(tokenize(" ".join(syns)))
-                phrases.update(normalize_text(x) for x in syns)
-                break
-    return tokens, phrases, norm
+    return tokens, norm
 
 
 def load_jsonl(path: Path) -> List[dict]:
-    rows: List[dict] = []
+    rows = []
     with path.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f, start=1):
+        for line in f:
             line = line.strip()
-            if not line:
-                continue
-            try:
+            if line:
                 rows.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                print(f"[WARN] skip invalid json line {i}: {e}")
     return rows
 
 
-def score_entry(entry: dict, prompt: str) -> dict:
-    expanded_tokens, expanded_phrases, norm_prompt = expand_prompt(prompt)
-    searchable = entry.get("searchable_text", "")
-    norm_searchable = normalize_text(searchable)
+def score_text(entry: dict, prompt: str) -> tuple[float, list[str], float, float]:
+    expanded_tokens, norm_prompt = expand_prompt(prompt)
+    searchable = normalize_text(entry.get("searchable_text", ""))
     searchable_tokens = set(tokenize(searchable))
-
-    overlap = expanded_tokens.intersection(searchable_tokens)
-    token_overlap_score = float(len(overlap)) / max(len(expanded_tokens), 1) * 10.0
-
-    phrase_bonus = 0.0
+    overlap = sorted(expanded_tokens.intersection(searchable_tokens))
+    token_score = float(len(overlap)) / max(len(expanded_tokens), 1) * 10.0
+    phrase_score = 0.0
     for phrase, bonus in PHRASE_BONUS_TABLE.items():
-        if phrase in norm_prompt and phrase in norm_searchable:
-            phrase_bonus += bonus
+        if phrase in norm_prompt and phrase in searchable:
+            phrase_score += bonus
+    if norm_prompt and norm_prompt in searchable:
+        phrase_score += 1.0
+    return token_score + phrase_score, overlap, token_score, phrase_score
 
-    if norm_prompt in norm_searchable and norm_prompt:
-        phrase_bonus += 1.0
 
-    stats = entry.get("motion_stats", {})
-    head_max = float(stats.get("head_delta_max_norm", 0.0) or 0.0)
-    expr_max = float(stats.get("expr_delta_max_norm", 0.0) or 0.0)
-    jaw_max = float(stats.get("jaw_delta_max_norm", 0.0) or 0.0)
-    intensity = float(stats.get("motion_intensity_score", 0.0) or 0.0)
+def score_entry(entry: dict, prompt: str, channel: str = "all") -> dict:
+    text_score, overlap, token_score, phrase_score = score_text(entry, prompt)
+    s = entry.get("motion_stats", {})
+    head = float(s.get("head_delta_max_norm", 0.0) or 0.0)
+    expr = float(s.get("expr_delta_max_norm", 0.0) or 0.0)
+    jaw = float(s.get("jaw_delta_max_norm", 0.0) or 0.0)
+    head_vel = float(s.get("head_velocity_max_norm", 0.0) or 0.0)
+    intensity = float(s.get("motion_intensity_score", 0.0) or 0.0)
+    head_purity = float(s.get("head_purity_score", 0.0) or 0.0)
+    expr_purity = float(s.get("expr_purity_score", 0.0) or 0.0)
+    jaw_purity = float(s.get("jaw_purity_score", 0.0) or 0.0)
 
-    prompt_tokens = set(tokenize(prompt))
-    motion_stats_score = 0.05 * intensity
-    if prompt_tokens & HEAD_HINTS:
-        motion_stats_score += 0.2 * head_max
-    if prompt_tokens & EXPR_HINTS:
-        motion_stats_score += 0.2 * expr_max
-    if prompt_tokens & JAW_HINTS:
-        motion_stats_score += 0.2 * jaw_max
+    if channel == "head":
+        motion_reward = 2.0 * head
+        purity_reward = 1.0 * head_purity
+        cross_penalty = 0.15 * expr + 0.10 * jaw
+        jitter_penalty = 1.0 * head_vel
+        total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
+    elif channel == "expr":
+        motion_reward = 1.5 * expr
+        purity_reward = 1.0 * expr_purity
+        cross_penalty = 0.5 * head
+        jitter_penalty = 0.1 * head_vel
+        total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
+    elif channel == "jaw":
+        motion_reward = 2.0 * jaw
+        purity_reward = 1.0 * jaw_purity
+        cross_penalty = 0.3 * head
+        jitter_penalty = 0.5 * head_vel
+        total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
+    else:
+        motion_reward = 0.05 * intensity + 0.2 * head + 0.2 * expr + 0.2 * jaw
+        purity_reward = cross_penalty = jitter_penalty = 0.0
+        total = text_score + motion_reward
 
-    total = token_overlap_score + phrase_bonus + motion_stats_score
     return {
-        "total_score": float(total),
-        "token_score": float(token_overlap_score),
-        "phrase_score": float(phrase_bonus),
-        "motion_score": float(motion_stats_score),
-        "token_overlap_score": float(token_overlap_score),
-        "phrase_bonus": float(phrase_bonus),
-        "motion_stats_score": float(motion_stats_score),
-        "matched_terms": sorted(overlap),
+        "total_score": float(total), "token_score": float(token_score), "phrase_score": float(phrase_score), "motion_score": float(motion_reward),
+        "matched_terms": overlap,
+        "channel_score_terms": {"text_score": float(text_score), "motion_reward": float(motion_reward), "purity_reward": float(purity_reward), "jitter_penalty": float(jitter_penalty), "cross_channel_penalty": float(cross_penalty)}
     }
 
 
-def retrieve(prompt: str, entries: List[dict], top_k: int) -> List[dict]:
+def retrieve(prompt: str, entries: List[dict], top_k: int, channel: str = "all") -> List[dict]:
     scored = []
     for e in entries:
-        s = score_entry(e, prompt)
-        row = {
-            "sample_id": e.get("sample_id", ""),
-            "motion_path": e.get("motion_path", ""),
-            "searchable_text": e.get("searchable_text", ""),
-            "annotations": e.get("annotations", {}),
-            "motion_stats": e.get("motion_stats", {}),
-            "retrieval_scores": {
-                "total_score": s["total_score"],
-                "token_score": s["token_score"],
-                "phrase_score": s["phrase_score"],
-                "motion_score": s["motion_score"],
-                "token_overlap_score": s["token_overlap_score"],
-                "phrase_bonus": s["phrase_bonus"],
-                "motion_stats_score": s["motion_stats_score"],
-            },
-            "matched_terms": s["matched_terms"],
-        }
+        sc = score_entry(e, prompt, channel)
+        row = {"sample_id": e.get("sample_id", ""), "motion_path": e.get("motion_path", ""), "searchable_text": e.get("searchable_text", ""), "annotations": e.get("annotations", {}), "motion_stats": e.get("motion_stats", {}), "channel": channel, "retrieval_scores": {"total_score": sc["total_score"], "token_score": sc["token_score"], "phrase_score": sc["phrase_score"], "motion_score": sc["motion_score"]}, "matched_terms": sc["matched_terms"], "channel_score_terms": sc["channel_score_terms"]}
         scored.append(row)
-
-    scored.sort(
-        key=lambda x: (
-            x["retrieval_scores"]["total_score"],
-            x["motion_stats"].get("motion_intensity_score", 0.0),
-            x.get("sample_id", ""),
-        ),
-        reverse=True,
-    )
-
-    top = scored[: max(0, top_k)]
-    for i, row in enumerate(top, start=1):
-        row["rank"] = i
+    scored.sort(key=lambda x: (x["retrieval_scores"]["total_score"], x.get("sample_id", "")), reverse=True)
+    top = scored[:max(0, top_k)]
+    for i, r in enumerate(top, start=1):
+        r["rank"] = i
     return top
 
 
@@ -173,43 +129,25 @@ def write_jsonl(path: Path, rows: List[dict]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def print_results(rows: List[dict], prompt: str) -> None:
-    print(f"[Retrieval] prompt={prompt!r}, top_k={len(rows)}")
+def print_results(rows: List[dict], prompt: str, channel: str) -> None:
+    print(f"[Retrieval] prompt={prompt!r}, channel={channel}, top_k={len(rows)}")
     for r in rows:
-        score = r["retrieval_scores"]["total_score"]
-        sid = r.get("sample_id", "")
-        motion = r.get("motion_path", "")
-        terms = ",".join(r.get("matched_terms", []))
-        print(f"  #{r['rank']:02d} score={score:.4f} sample_id={sid} motion={motion}")
-        print(f"      matched_terms=[{terms}]")
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Keyword retrieval over MMHead codebook JSONL.")
-    ap.add_argument("--prompt", required=True, type=str)
-    ap.add_argument("--codebook_jsonl", required=True, type=Path)
-    ap.add_argument("--top_k", type=int, default=10)
-    ap.add_argument("--output_jsonl", type=Path, default=None)
-    return ap
+        print(f"  #{r['rank']:02d} score={r['retrieval_scores']['total_score']:.4f} sample_id={r['sample_id']}")
 
 
 def main() -> None:
-    ap = build_argparser()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt", required=True)
+    ap.add_argument("--codebook_jsonl", required=True, type=Path)
+    ap.add_argument("--top_k", type=int, default=10)
+    ap.add_argument("--channel", choices=["all", "head", "expr", "jaw"], default="all")
+    ap.add_argument("--output_jsonl", type=Path, default=None)
     args = ap.parse_args()
-
-    if not args.codebook_jsonl.exists():
-        raise SystemExit(f"codebook_jsonl not found: {args.codebook_jsonl}")
-
     entries = load_jsonl(args.codebook_jsonl)
-    if not entries:
-        raise SystemExit("Empty codebook JSONL.")
-
-    top_rows = retrieve(prompt=args.prompt, entries=entries, top_k=args.top_k)
-    print_results(top_rows, args.prompt)
-
+    rows = retrieve(args.prompt, entries, args.top_k, args.channel)
+    print_results(rows, args.prompt, args.channel)
     if args.output_jsonl:
-        write_jsonl(args.output_jsonl, top_rows)
-        print(f"[Saved] {args.output_jsonl}")
+        write_jsonl(args.output_jsonl, rows)
 
 
 if __name__ == "__main__":

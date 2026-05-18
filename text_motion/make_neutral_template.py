@@ -83,14 +83,17 @@ def main() -> None:
     ref_idx = choose_reference_frame(frame_payloads, args.reference_frame, args.auto_neutral)
     ref = frame_payloads[ref_idx]
 
-    keys_to_apply = ["expr", "jaw_pose", "rotation", "translation", "eyes_pose", "shape"]
+    keys_to_apply = ["expr", "jaw_pose", "rotation", "neck_pose", "translation", "eyes_pose", "shape"]
     modified_keys = set()
+    skipped_keys = set()
 
     for payload in frame_payloads:
         for k in keys_to_apply:
             if k in ref and k in payload:
                 payload[k] = np.asarray(ref[k]).copy()
                 modified_keys.add(k)
+            elif k not in payload:
+                skipped_keys.add(k)
 
     for p, payload in zip(frame_paths, frame_payloads):
         save_npz(p, payload)
@@ -98,6 +101,16 @@ def main() -> None:
     print(f"[Neutral template] num_frames={len(frame_paths)}")
     print(f"[Neutral template] chosen reference frame={ref_idx}")
     print(f"[Neutral template] modified keys={sorted(modified_keys)}")
+    print(f"[Neutral template] skipped keys={sorted(skipped_keys)}")
+
+    for k in sorted(modified_keys):
+        refv = np.asarray(ref[k]).astype(np.float32)
+        max_diff = 0.0
+        for payload in frame_payloads:
+            cur = np.asarray(payload[k]).astype(np.float32)
+            max_diff = max(max_diff, float(np.max(np.abs(cur - refv))))
+        print(f"[Neutral template] max_diff {k}={max_diff:.8f}")
+
     print(f"[Neutral template] output={args.output_motion}")
 
 
