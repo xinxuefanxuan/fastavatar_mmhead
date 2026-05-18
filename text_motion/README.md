@@ -207,3 +207,53 @@ python text_motion/run_text_to_mmhead_motion.py \
 - `*_smooth_window > 1` 时，按时间维做中心滑动平均（边界用 edge padding）。
 - `head_max_step > 0` 时，会对帧间头部步长做范数钳制并重建轨迹。
 - 默认参数（window=1, max_step=0）保持旧行为不变。
+
+## 8) 构建中性静态模板（neutral template）
+
+当你希望“文本检索动作”不叠加原模板动态，而是从静态中性状态出发时，可先构建 neutral 模板：
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --reference_frame 0
+```
+
+或自动选择最中性帧：
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --auto_neutral
+```
+
+自动中性评分（使用可用键）：
+
+- `score = ||expr||_2 + ||jaw_pose||_2 + 0.3 * ||rotation||_2`
+
+脚本行为：
+- 先完整复制模板目录到输出目录；
+- 遍历 `flame_param/*.npz`；
+- 将每帧 `expr/jaw_pose/rotation/translation/eyes_pose/shape`（若存在）替换为参考帧值；
+- 保留 `canonical_flame_param.npz`、`transforms*.json`、`processed_data/` 以及其他文件不变。
+
+随后可将 neutral 模板用于检索驱动：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_neutral_turn_left_smile \
+  --top_k 10 \
+  --rank_index 0 \
+  --mode all \
+  --num_frames 90 \
+  --expr_scale 0.12 \
+  --head_scale 0.05 \
+  --jaw_scale 0.2 \
+  --head_smooth_window 9 \
+  --jaw_smooth_window 3 \
+  --head_max_step 0.03
+```
