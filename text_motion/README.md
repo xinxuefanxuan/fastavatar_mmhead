@@ -312,3 +312,38 @@ bash scripts/infer/infer.sh \
 ```
 
 注意：传给 `infer.sh` 的 motion 目录建议带 trailing slash（`.../`）。
+
+## Direction calibration and head-axis controls
+
+When composed head motion direction looks inverted (e.g. prompt asks "left" but render looks "right"), use head axis controls in composed generation:
+
+```bash
+python text_motion/run_text_to_composed_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_composed_turn_left_smile \
+  --top_k 10 \
+  --head_target_field neck_pose \
+  --head_axis_order 0,1,2 \
+  --head_axis_signs 1,-1,1
+```
+
+`--head_axis_order` reorders MMHead head channels before writing to FastAvatar head target field, and `--head_axis_signs` applies per-axis sign flips.
+
+To manually calibrate which `neck_pose` axis/sign corresponds to viewer-left/viewer-right, generate six calibration motions:
+
+```bash
+python text_motion/calibrate_neck_axes.py \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_root assets/sample_motion/neck_axis_calib \
+  --num_frames 16 \
+  --amplitude 0.2
+```
+
+This creates:
+- `axis0_pos`, `axis0_neg`
+- `axis1_pos`, `axis1_neg`
+- `axis2_pos`, `axis2_neg`
+
+Render each folder and map axis/sign to your desired visual direction.

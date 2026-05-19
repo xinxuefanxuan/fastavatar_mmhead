@@ -82,6 +82,26 @@ def delta_from_source(src, n, ref_n):
     return src - ref
 
 
+def parse_csv_int_list(text: str, expected_len: int, name: str) -> list[int]:
+    parts = [p.strip() for p in text.split(",") if p.strip() != ""]
+    if len(parts) != expected_len:
+        raise SystemExit(f"{name} expects {expected_len} comma-separated integers, got: {text}")
+    try:
+        return [int(x) for x in parts]
+    except ValueError as exc:
+        raise SystemExit(f"{name} contains non-integer value: {text}") from exc
+
+
+def transform_head_delta(delta: np.ndarray, axis_order: list[int], axis_signs: list[int]) -> np.ndarray:
+    if delta.ndim != 2:
+        delta = delta.reshape(delta.shape[0], -1)
+    if delta.shape[1] < 3:
+        raise SystemExit(f"head delta must have at least 3 channels, got shape={delta.shape}")
+    out = delta.copy()
+    out[:, :3] = out[:, axis_order] * np.asarray(axis_signs, dtype=np.float32)[None, :]
+    return out
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--prompt', required=True)
@@ -102,8 +122,17 @@ def main():
     ap.add_argument('--jaw_smooth_window', type=int, default=1)
     ap.add_argument('--head_max_step', type=float, default=0.0)
     ap.add_argument('--head_target_field', choices=['neck_pose','rotation'], default='neck_pose')
+    ap.add_argument('--head_axis_order', type=str, default='0,1,2')
+    ap.add_argument('--head_axis_signs', type=str, default='1,1,1')
     ap.add_argument('--save_metadata_json', type=Path, default=None)
     args=ap.parse_args()
+    head_axis_order = parse_csv_int_list(args.head_axis_order, 3, '--head_axis_order')
+    head_axis_signs = parse_csv_int_list(args.head_axis_signs, 3, '--head_axis_signs')
+    if sorted(head_axis_order) != [0, 1, 2]:
+        raise SystemExit(f'--head_axis_order must be a permutation of 0,1,2, got {head_axis_order}')
+    for s in head_axis_signs:
+        if s not in (-1, 1):
+            raise SystemExit(f'--head_axis_signs values must be -1 or 1, got {head_axis_signs}')
 
     if args.output_motion.exists(): raise SystemExit(f'output exists: {args.output_motion}')
     shutil.copytree(args.template_motion, args.output_motion)
@@ -134,6 +163,7 @@ def main():
         if args.head_smooth_window > 1: mm_head = smooth_sequence_centered(mm_head, args.head_smooth_window)
         if args.head_max_step > 0: mm_head,_,_ = clamp_head_velocity(mm_head, args.head_max_step)
         delta = delta_from_source(mm_head, n, args.ref_n)
+        delta = transform_head_delta(delta, head_axis_order, head_axis_signs)
         apply_delta_to_field(payloads, args.head_target_field, delta, args.head_scale, n, 'head')
 
     if intents['need_jaw'] and jaw_rows:
@@ -153,6 +183,7 @@ def main():
             'selected_jaw_sample': jaw_rows[args.jaw_rank_index] if jaw_rows else None,
             'channel_scales': {'head_scale': args.head_scale, 'expr_scale': args.expr_scale, 'jaw_scale': args.jaw_scale},
             'smoothing_clamp': {'expr_smooth_window': args.expr_smooth_window, 'head_smooth_window': args.head_smooth_window, 'jaw_smooth_window': args.jaw_smooth_window, 'head_max_step': args.head_max_step},
+            'head_axis_transform': {'head_axis_order': head_axis_order, 'head_axis_signs': head_axis_signs},
             'target_fields': {'head_target_field': args.head_target_field, 'expr_target_field': 'expr', 'jaw_target_field': 'jaw_pose'},
             'output_motion': str(args.output_motion),
             'recommended_infer_command': f"bash scripts/infer/infer.sh configs/inference/infer.yaml model_zoo/fastavatar/ assets/sample_input/mono_video/nersemble_seq_214.mp4 {str(args.output_motion)}/ 16 16 Monocular false"

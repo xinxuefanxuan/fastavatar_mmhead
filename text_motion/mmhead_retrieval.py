@@ -24,6 +24,9 @@ PHRASE_BONUS_TABLE = {"turn head left": 2.5, "turn head right": 2.5, "look left"
 
 SMILE_TERMS = {"smile", "smiling", "happy", "grin"}
 EXPR_NEGATIVE_TERMS = ["blink", "kiss", "suck cheeks", "hide lips", "eyes wide", "lower eyebrows"]
+LEFT_POSITIVE_PHRASES = ["turn left", "turning left", "head left", "look left", "left turn"]
+RIGHT_POSITIVE_PHRASES = ["turn right", "turning right", "head right", "look right", "right turn"]
+MIXED_DIRECTION_PHRASES = ["left and right", "right and left", "look around"]
 
 
 def contains_any_phrase(text: str, phrases) -> bool:
@@ -88,11 +91,44 @@ def score_entry(entry: dict, prompt: str, channel: str = "all") -> dict:
     jaw_purity = float(s.get("jaw_purity_score", 0.0) or 0.0)
 
     if channel == "head":
+        searchable_norm = normalize_text(entry.get("searchable_text", ""))
+        detail_head_pose = normalize_text(entry.get("annotations", {}).get("detail_head_pose", ""))
+        dir_text = f"{searchable_norm} {detail_head_pose}".strip()
+        prompt_norm = normalize_text(prompt)
+        wants_left = "left" in tokenize(prompt_norm)
+        wants_right = "right" in tokenize(prompt_norm)
+        opposite_direction_penalty = 0.0
+        mixed_direction_penalty = 0.0
+        direction_bonus = 0.0
+        if wants_left and not wants_right:
+            if contains_any_phrase(dir_text, LEFT_POSITIVE_PHRASES):
+                direction_bonus += 3.0
+            if contains_any_phrase(dir_text, RIGHT_POSITIVE_PHRASES):
+                opposite_direction_penalty += 2.5
+            if contains_any_phrase(dir_text, MIXED_DIRECTION_PHRASES):
+                mixed_direction_penalty += 2.0
+        elif wants_right and not wants_left:
+            if contains_any_phrase(dir_text, RIGHT_POSITIVE_PHRASES):
+                direction_bonus += 3.0
+            if contains_any_phrase(dir_text, LEFT_POSITIVE_PHRASES):
+                opposite_direction_penalty += 2.5
+            if contains_any_phrase(dir_text, MIXED_DIRECTION_PHRASES):
+                mixed_direction_penalty += 2.0
+
         motion_reward = 2.0 * head
         purity_reward = 1.0 * head_purity
         cross_penalty = 0.15 * expr + 0.10 * jaw
         jitter_penalty = 1.0 * head_vel
-        total = text_score + motion_reward + purity_reward - cross_penalty - jitter_penalty
+        total = (
+            text_score
+            + direction_bonus
+            + motion_reward
+            + purity_reward
+            - cross_penalty
+            - jitter_penalty
+            - opposite_direction_penalty
+            - mixed_direction_penalty
+        )
     elif channel == "expr":
         searchable_norm = normalize_text(entry.get("searchable_text", ""))
         prompt_norm = normalize_text(prompt)
@@ -123,10 +159,17 @@ def score_entry(entry: dict, prompt: str, channel: str = "all") -> dict:
         purity_reward = cross_penalty = jitter_penalty = 0.0
         total = text_score + motion_reward
 
+    channel_terms = {
+        "text_score": float(text_score), "motion_reward": float(motion_reward), "purity_reward": float(purity_reward), "jitter_penalty": float(jitter_penalty), "cross_channel_penalty": float(cross_penalty)
+    }
+    if channel == "head":
+        channel_terms["opposite_direction_penalty"] = float(opposite_direction_penalty)
+        channel_terms["mixed_direction_penalty"] = float(mixed_direction_penalty)
+        channel_terms["direction_bonus"] = float(direction_bonus)
     return {
         "total_score": float(total), "token_score": float(token_score), "phrase_score": float(phrase_score), "motion_score": float(motion_reward),
         "matched_terms": overlap,
-        "channel_score_terms": {"text_score": float(text_score), "motion_reward": float(motion_reward), "purity_reward": float(purity_reward), "jitter_penalty": float(jitter_penalty), "cross_channel_penalty": float(cross_penalty)}
+        "channel_score_terms": channel_terms
     }
 
 
