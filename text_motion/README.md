@@ -347,3 +347,36 @@ This creates:
 - `axis2_pos`, `axis2_neg`
 
 Render each folder and map axis/sign to your desired visual direction.
+
+## P2.1: 构建训练用规范化运动数据集
+
+用于下一阶段 motion AE/VAE 训练的数据导出（不包含模型训练）。
+
+### 构建数据集
+
+```bash
+python text_motion/build_motion_dataset.py \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --output_root outputs/motion_dataset_v1 \
+  --target_len 90 \
+  --min_frames 32 \
+  --ref_n 5 \
+  --head_axis_signs 1,-1,1
+```
+
+脚本会：
+- 读取 codebook；
+- 按 native MMHead pkl 提取 `expcodes/posecodes`；
+- 构建 `expr/head/jaw` 的 delta 序列；
+- 对 `head` 应用 `--head_axis_signs`；
+- 统一到 `target_len`；
+- 输出 `motions/*.npz` + `manifest.jsonl/train.jsonl/val.jsonl`。
+
+### 检查数据集
+
+```bash
+python text_motion/inspect_motion_dataset.py \
+  --dataset_root outputs/motion_dataset_v1
+```
+
+输出包括：样本数、train/val 数、motion shape、expr/head/jaw 的 norm 统计与示例条目。
