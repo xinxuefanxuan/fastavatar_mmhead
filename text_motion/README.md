@@ -380,3 +380,29 @@ python text_motion/inspect_motion_dataset.py \
 ```
 
 输出包括：样本数、train/val 数、motion shape、expr/head/jaw 的 norm 统计与示例条目。
+
+## P2.2: 将导出的 motion npz 回写为 FastAvatar 动作目录
+
+将 `build_motion_dataset.py` 导出的单个样本（如 `[T,56]`）写回 neutral 模板，生成可直接用于 FastAvatar 推理的 motion 目录。
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion_dir assets/sample_motion/rendered_from_npz_example \
+  --motion_key motion \
+  --head_target neck_pose \
+  --smooth \
+  --head_velocity_clamp 0.03 \
+  --overwrite
+```
+
+默认通道布局：
+- `motion[:, 0:50] -> expr_delta`
+- `motion[:, 50:53] -> head_delta`
+- `motion[:, 53:56] -> jaw_delta`
+
+并分别写入：
+- `expr_delta -> expr`
+- `head_delta -> neck_pose`（可切换到 `rotation`）
+- `jaw_delta -> jaw_pose`
