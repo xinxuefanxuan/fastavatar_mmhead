@@ -389,7 +389,8 @@ python text_motion/inspect_motion_dataset.py \
 python text_motion/render_motion_npz.py \
   --motion_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
   --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
-  --output_motion_dir assets/sample_motion/rendered_from_npz_example \
+  --output_motion_root outputs/mmhead_debug/render_npz_test_fixed \
+  --sequence_name EXAMPLE_ID \
   --motion_key motion \
   --head_target neck_pose \
   --smooth \
@@ -406,3 +407,16 @@ python text_motion/render_motion_npz.py \
 - `expr_delta -> expr`
 - `head_delta -> neck_pose`（可切换到 `rotation`）
 - `jaw_delta -> jaw_pose`
+
+推荐用于 FastAvatar 的目录布局（`--output_motion_root`）：
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/mmhead_debug/motion_dataset_v1_debug/motions/CELEBVHQ_01ClRWyf9I4_0.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion_root outputs/mmhead_debug/render_npz_test_fixed \
+  --sequence_name CELEBVHQ_01ClRWyf9I4_0 \
+  --motion_key motion \
+  --head_target neck_pose \
+  --overwrite
+```

@@ -76,11 +76,70 @@ def apply_delta(payloads, key: str, delta: np.ndarray):
         p[key] = out[i]
 
 
+ROOT_META_FILES = [
+    "canonical_flame_param.npz",
+    "transforms.json",
+    "transforms_train.json",
+    "transforms_val.json",
+    "transforms_test.json",
+    "transforms_backup.json",
+    "transforms_backup_flame.json",
+]
+
+
+def prepare_output_layout(
+    neutral_template: Path,
+    output_motion_dir: Path | None,
+    output_motion_root: Path | None,
+    sequence_name: str | None,
+    overwrite: bool,
+    motion_npz: Path,
+) -> tuple[Path, Path | None, str | None, list[str]]:
+    if output_motion_root is not None:
+        seq_name = sequence_name or motion_npz.stem
+        root_dir = output_motion_root
+        seq_dir = root_dir / seq_name
+        if root_dir.exists():
+            if not overwrite:
+                raise SystemExit(f"output root exists: {root_dir}; use --overwrite")
+            shutil.rmtree(root_dir)
+        root_dir.mkdir(parents=True, exist_ok=True)
+
+        copied_root_files: list[str] = []
+        for name in ROOT_META_FILES:
+            src = neutral_template / name
+            if src.exists():
+                shutil.copy2(src, root_dir / name)
+                copied_root_files.append(name)
+
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        for child in neutral_template.iterdir():
+            if child.name in copied_root_files:
+                continue
+            dst = seq_dir / child.name
+            if child.is_dir():
+                shutil.copytree(child, dst)
+            else:
+                shutil.copy2(child, dst)
+        return seq_dir, root_dir, seq_name, copied_root_files
+
+    if output_motion_dir is None:
+        raise SystemExit("either --output_motion_dir or --output_motion_root must be provided")
+    if output_motion_dir.exists():
+        if not overwrite:
+            raise SystemExit(f"output exists: {output_motion_dir}; use --overwrite")
+        shutil.rmtree(output_motion_dir)
+    shutil.copytree(neutral_template, output_motion_dir)
+    return output_motion_dir, None, None, []
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--motion_npz", type=Path, required=True)
     ap.add_argument("--neutral_template", type=Path, required=True)
-    ap.add_argument("--output_motion_dir", type=Path, required=True)
+    ap.add_argument("--output_motion_dir", type=Path, default=None)
+    ap.add_argument("--output_motion_root", type=Path, default=None)
+    ap.add_argument("--sequence_name", type=str, default=None)
     ap.add_argument("--motion_key", type=str, default="motion")
     ap.add_argument("--head_target", choices=["neck_pose", "rotation"], default="neck_pose")
     ap.add_argument("--smooth", action="store_true")
@@ -88,13 +147,15 @@ def main() -> None:
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    if args.output_motion_dir.exists():
-        if not args.overwrite:
-            raise SystemExit(f"output exists: {args.output_motion_dir}; use --overwrite")
-        shutil.rmtree(args.output_motion_dir)
-
-    shutil.copytree(args.neutral_template, args.output_motion_dir)
-    frame_paths, payloads = load_template_frames(args.output_motion_dir)
+    target_motion_dir, output_root, sequence_name, root_meta = prepare_output_layout(
+        neutral_template=args.neutral_template,
+        output_motion_dir=args.output_motion_dir,
+        output_motion_root=args.output_motion_root,
+        sequence_name=args.sequence_name,
+        overwrite=args.overwrite,
+        motion_npz=args.motion_npz,
+    )
+    frame_paths, payloads = load_template_frames(target_motion_dir)
 
     data = np.load(args.motion_npz, allow_pickle=True)
     if args.motion_key not in data:
@@ -137,8 +198,14 @@ def main() -> None:
 
     for p, payload in zip(frame_paths, payloads):
         np.savez(p, **payload)
-    print(f"[Write] output_motion_dir={args.output_motion_dir}")
-    print(f"[Write] frame files={len(frame_paths)}")
+    if output_root is not None:
+        print(f"[Write] output_motion_root={output_root}")
+        print(f"[Write] sequence_name={sequence_name}")
+        print(f"[Write] root metadata files={root_meta}")
+        print(f"[Write] sequence_dir={target_motion_dir}")
+    else:
+        print(f"[Write] output_motion_dir={target_motion_dir}")
+    print(f"[Write] flame_param files updated={len(frame_paths)}")
 
 
 if __name__ == "__main__":
