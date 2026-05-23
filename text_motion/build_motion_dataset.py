@@ -126,6 +126,22 @@ def build_record(entry: dict, out_npz: Path, target_len: int, dims: dict[str, in
         "dims": {k: int(v) for k, v in dims.items()},
     }
 
+def compute_norm_stats(npz_paths: list[Path]) -> tuple[np.ndarray, np.ndarray]:
+    if not npz_paths:
+        raise SystemExit("no samples saved, cannot compute normalization stats")
+    sum_x = np.zeros(56, dtype=np.float64)
+    sum_x2 = np.zeros(56, dtype=np.float64)
+    count = 0
+    for p in npz_paths:
+        arr = np.asarray(np.load(p, allow_pickle=True)["motion_raw"], dtype=np.float32)
+        sum_x += arr.sum(axis=0)
+        sum_x2 += (arr * arr).sum(axis=0)
+        count += arr.shape[0]
+    mean = sum_x / max(count, 1)
+    var = np.maximum(sum_x2 / max(count, 1) - mean * mean, 1e-12)
+    std = np.sqrt(var)
+    return mean.astype(np.float32), std.astype(np.float32)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -158,6 +174,7 @@ def main() -> None:
     n_total = 0
     n_saved = 0
     n_skipped = 0
+    saved_paths: list[Path] = []
     for entry in entries:
         n_total += 1
         sample_id = str(entry.get("sample_id", "")).strip()
@@ -225,6 +242,8 @@ def main() -> None:
         out_npz = motions_dir / f"{sample_id}.npz"
         np.savez(
             out_npz,
+            motion_raw=motion,
+            motion_norm=motion.copy(),
             motion=motion,
             expr_delta=expr_delta.astype(np.float32),
             head_delta=head_delta.astype(np.float32),
@@ -234,7 +253,26 @@ def main() -> None:
         )
 
         records.append(build_record(entry, out_npz, args.target_len, dims))
+        saved_paths.append(out_npz)
         n_saved += 1
+
+    if saved_paths:
+        mean, std = compute_norm_stats(saved_paths)
+        for p in saved_paths:
+            data = dict(np.load(p, allow_pickle=True))
+            motion_raw = np.asarray(data["motion_raw"], dtype=np.float32)
+            motion_norm = (motion_raw - mean[None, :]) / std[None, :]
+            data["motion_norm"] = motion_norm.astype(np.float32)
+            np.savez(p, **data)
+        norm_stats = {
+            "mean": mean.tolist(),
+            "std": std.tolist(),
+            "dims": 56,
+            "layout": {"expr": [0, 50], "head": [50, 53], "jaw": [53, 56]},
+        }
+        (output_root / "norm_stats.json").write_text(
+            json.dumps(norm_stats, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
     records = sorted(records, key=lambda x: x["sample_id"])
     n_train = int(len(records) * args.split_ratio)
@@ -256,6 +294,7 @@ def main() -> None:
         "head_axis_signs": head_signs.tolist(),
         "split_ratio": float(args.split_ratio),
         "sample_mode": args.sample_mode,
+        "has_norm_stats": bool(saved_paths),
     }
     (output_root / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(meta, ensure_ascii=False, indent=2))

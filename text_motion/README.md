@@ -420,3 +420,37 @@ python text_motion/render_motion_npz.py \
   --head_target neck_pose \
   --overwrite
 ```
+
+## P3.1 Motion Autoencoder（非VAE）
+
+先确保 P2.1 数据集已包含：
+- `motion_raw`（未归一化 56 维）
+- `motion_norm`（按 `norm_stats.json` 逐维归一化）
+
+### 训练 AE
+
+```bash
+python motion_model/train_motion_ae.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_dir outputs/motion_ae_v1 \
+  --latent_dim 64 \
+  --epochs 30 \
+  --batch_size 64
+```
+
+损失为加权重建：
+- expr: 1
+- head: 10
+- jaw: 10
+
+### 重建单个样本
+
+```bash
+python motion_model/reconstruct_motion_ae.py \
+  --input_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --checkpoint outputs/motion_ae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_ae_v1/recon_EXAMPLE_ID.npz
+```
+
+输出 `recon_*.npz` 包含 `motion`/`motion_raw`/`motion_norm` 与 `expr_delta/head_delta/jaw_delta`，可直接配合 `text_motion/render_motion_npz.py` 渲染。
