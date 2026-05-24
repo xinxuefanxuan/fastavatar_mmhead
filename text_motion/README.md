@@ -580,3 +580,34 @@ python motion_model/generate_from_primitive.py \
 - `expr_delta`
 - `head_delta`
 - `jaw_delta`
+
+## P4.2 Primitive latent prototype baseline
+
+当 primitive->latent MLP 学不到有效提升时，可先使用 prototype baseline：每个 primitive 聚合一个 latent 原型（均值/方差）。
+
+### 1) 构建 primitive latent prototypes
+
+```bash
+python motion_model/build_primitive_latent_prototypes.py \
+  --labeled_root outputs/primitive_labels_v1 \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --output_path outputs/primitive_labels_v1/prototypes.pt
+```
+
+可选：`--top_k` 用于快速调试仅前 K 条样本。
+
+### 2) 从 prototype 生成动作
+
+```bash
+python motion_model/generate_from_primitive_prototype.py \
+  --primitive turn_left \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_turn_left_proto.npz \
+  --target_len 64 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+输出 `npz` 与 `render_motion_npz.py` 兼容（`motion/motion_raw/motion_norm/expr_delta/head_delta/jaw_delta`）。
