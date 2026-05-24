@@ -485,7 +485,13 @@ python motion_model/sample_motion_vae.py \
   --checkpoint outputs/motion_vae_v1/best.pt \
   --norm_stats outputs/motion_dataset_v1/norm_stats.json \
   --output_npz outputs/motion_vae_v1/sample_000.npz \
-  --num_frames 64
+  --num_frames 64 \
+  --z_scale 0.5 \
+  --num_samples 4 \
+  --smooth \
+  --smooth_window 5 \
+  --head_scale 1.0 \
+  --head_velocity_clamp 0.03
 ```
 
 采样输出字段与 `render_motion_npz.py` 兼容：
