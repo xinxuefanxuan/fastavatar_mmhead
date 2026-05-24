@@ -514,3 +514,62 @@ python motion_model/reconstruct_motion_vae.py \
 ```
 
 输出同样与 `render_motion_npz.py` 兼容，并打印原始/重建的 expr/head/jaw 统计。
+
+## P4.1 Primitive-label-to-latent（规则标签）
+
+当前仅做 primitive 标签到 latent 的监督映射，不做 free-form text embedding。
+
+### 1) 生成 primitive 标签
+
+```bash
+python motion_model/build_primitive_labels.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_root outputs/primitive_labels_v1
+```
+
+标签集合：
+- `turn_left`
+- `turn_right`
+- `nod`
+- `smile`
+- `mouth_open`
+- `neutral`
+- `other`
+
+会输出：
+- `train_labeled.jsonl`
+- `val_labeled.jsonl`
+- `label_map.json`
+并打印标签分布。
+
+### 2) 训练 primitive -> latent 预测器
+
+```bash
+python motion_model/train_primitive_to_latent.py \
+  --labeled_root outputs/primitive_labels_v1 \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --output_dir outputs/primitive_to_latent_v1 \
+  --epochs 30
+```
+
+说明：训练时会冻结 VAE，仅用其 encoder 的 `mu`（时序均值）作为监督目标 latent。
+
+### 3) 从 primitive 生成动作（渲染兼容 npz）
+
+```bash
+python motion_model/generate_from_primitive.py \
+  --primitive_checkpoint outputs/primitive_to_latent_v1/best.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --primitive_label turn_left \
+  --output_npz outputs/primitive_to_latent_v1/gen_turn_left.npz \
+  --num_frames 64
+```
+
+输出字段与 `render_motion_npz.py` 兼容：
+- `motion`
+- `motion_raw`
+- `motion_norm`
+- `expr_delta`
+- `head_delta`
+- `jaw_delta`
