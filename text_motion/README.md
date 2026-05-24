@@ -611,3 +611,24 @@ python motion_model/generate_from_primitive_prototype.py \
 ```
 
 输出 `npz` 与 `render_motion_npz.py` 兼容（`motion/motion_raw/motion_norm/expr_delta/head_delta/jaw_delta`）。
+
+## P4.3 Primitive latent composition
+
+使用 neutral 原型作为基底，按方向组合多个 primitive latent：
+
+`z = z_neutral + sum_i alpha_i * (z_primitive_i - z_neutral)`
+
+```bash
+python motion_model/generate_composed_primitive.py \
+  --primitives turn_left,smile \
+  --weights 1.0,0.8 \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_turn_left_smile_comp.npz \
+  --target_len 64 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+输出 `npz` 与 `render_motion_npz.py` 兼容，并打印 expr/head/jaw 统计与 head yaw 的 min/max。
