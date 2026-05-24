@@ -454,3 +454,44 @@ python motion_model/reconstruct_motion_ae.py \
 ```
 
 输出 `recon_*.npz` 包含 `motion`/`motion_raw`/`motion_norm` 与 `expr_delta/head_delta/jaw_delta`，可直接配合 `text_motion/render_motion_npz.py` 渲染。
+
+## P3.2 Motion VAE（最小增量）
+
+在 P3.1 AE 基础上增加 `mu/logvar` 与重参数化，训练目标：
+
+- `L = recon_loss + beta * KL`
+- `beta` 默认 `1e-4`
+- 默认启用 KL warmup（前 20 个 epoch 线性升温）
+- recon_loss 仍使用通道加权：expr=1, head=10, jaw=10
+
+### 训练 VAE
+
+```bash
+python motion_model/train_motion_vae.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_dir outputs/motion_vae_v1 \
+  --latent_dim 64 \
+  --epochs 30 \
+  --beta 1e-4 \
+  --kl_warmup_epochs 20
+```
+
+输出：`best.pt`、`last.pt`、`train_log.json`。
+
+### 采样新动作（渲染兼容 npz）
+
+```bash
+python motion_model/sample_motion_vae.py \
+  --checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_vae_v1/sample_000.npz \
+  --num_frames 64
+```
+
+采样输出字段与 `render_motion_npz.py` 兼容：
+- `motion`
+- `motion_raw`
+- `motion_norm`
+- `expr_delta`
+- `head_delta`
+- `jaw_delta`
