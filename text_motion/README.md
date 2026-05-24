@@ -495,3 +495,16 @@ python motion_model/sample_motion_vae.py \
 - `expr_delta`
 - `head_delta`
 - `jaw_delta`
+
+### VAE 重建单个样本（deterministic, use mu）
+
+```bash
+python motion_model/reconstruct_motion_vae.py \
+  --input_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_vae_v1/recon_EXAMPLE_ID_from_vae.npz \
+  --motion_key motion_norm
+```
+
+输出同样与 `render_motion_npz.py` 兼容，并打印原始/重建的 expr/head/jaw 统计。
