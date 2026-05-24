@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from motion_model.models import TemporalConvVAE
 
@@ -82,12 +82,28 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--balanced_sampler", action="store_true")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     label_map = json.loads((args.labeled_root / "label_map.json").read_text(encoding="utf-8"))
     tr = read_jsonl(args.labeled_root / "train_labeled.jsonl")
     va = read_jsonl(args.labeled_root / "val_labeled.jsonl")
+    inv_label_map = {v: k for k, v in label_map.items()}
+    c_tr: dict[int, int] = {}
+    c_va: dict[int, int] = {}
+    for r in tr:
+        idx = label_map.get(r.get("primitive_label", "other"), label_map["other"])
+        c_tr[idx] = c_tr.get(idx, 0) + 1
+    for r in va:
+        idx = label_map.get(r.get("primitive_label", "other"), label_map["other"])
+        c_va[idx] = c_va.get(idx, 0) + 1
+    print("[Train label counts]")
+    for i in sorted(inv_label_map):
+        print(f"  {inv_label_map[i]}: {c_tr.get(i, 0)}")
+    print("[Val label counts]")
+    for i in sorted(inv_label_map):
+        print(f"  {inv_label_map[i]}: {c_va.get(i, 0)}")
 
     ckpt = torch.load(args.vae_checkpoint, map_location=args.device)
     latent_dim = int(ckpt.get("args", {}).get("latent_dim", 64))
@@ -96,7 +112,16 @@ def main():
 
     ds_tr = PrimitiveLatentDataset(tr, label_map, vae, args.device)
     ds_va = PrimitiveLatentDataset(va, label_map, vae, args.device)
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True)
+    if args.balanced_sampler:
+        label_ids = [int(x[0]) for x in ds_tr.items]
+        cnts: dict[int, int] = {}
+        for lid in label_ids:
+            cnts[lid] = cnts.get(lid, 0) + 1
+        weights = [1.0 / max(cnts[lid], 1) for lid in label_ids]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, sampler=sampler)
+    else:
+        dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True)
     dl_va = DataLoader(ds_va, batch_size=args.batch_size, shuffle=False)
 
     model = PrimitiveMLP(num_labels=len(label_map), latent_dim=latent_dim).to(args.device)

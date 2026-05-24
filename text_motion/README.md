@@ -524,7 +524,13 @@ python motion_model/reconstruct_motion_vae.py \
 ```bash
 python motion_model/build_primitive_labels.py \
   --dataset_root outputs/motion_dataset_v1 \
-  --output_root outputs/primitive_labels_v1
+  --output_root outputs/primitive_labels_v1 \
+  --yaw_threshold 0.015 \
+  --pitch_threshold 0.015 \
+  --jaw_threshold 0.01 \
+  --neutral_threshold 0.02 \
+  --max_per_label 1200 \
+  --val_ratio 0.1
 ```
 
 标签集合：
@@ -549,7 +555,8 @@ python motion_model/train_primitive_to_latent.py \
   --labeled_root outputs/primitive_labels_v1 \
   --vae_checkpoint outputs/motion_vae_v1/best.pt \
   --output_dir outputs/primitive_to_latent_v1 \
-  --epochs 30
+  --epochs 30 \
+  --balanced_sampler
 ```
 
 说明：训练时会冻结 VAE，仅用其 encoder 的 `mu`（时序均值）作为监督目标 latent。
