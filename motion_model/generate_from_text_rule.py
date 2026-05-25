@@ -19,9 +19,21 @@ DEFAULT_WEIGHTS = {
     "nod": 1.5,
     "neutral": 1.0,
 }
+DEFAULT_INTENSITY_MULTIPLIERS = {
+    "slight": 0.7,
+    "subtle": 0.7,
+    "a little": 0.7,
+    "very": 1.3,
+    "strong": 1.5,
+    "big": 1.5,
+    "exaggerated": 1.5,
+}
 
-
-def parse_prompt_to_primitives(prompt: str) -> tuple[list[str], list[float], float]:
+def parse_prompt_to_primitives(
+    prompt: str,
+    default_weights: dict[str, float],
+    intensity_multipliers: dict[str, float],
+) -> tuple[list[str], list[float], float]:
     p = prompt.lower()
     primitives: list[str] = []
     if any(x in p for x in ["turn left", "look left", " left"]):
@@ -41,14 +53,11 @@ def parse_prompt_to_primitives(prompt: str) -> tuple[list[str], list[float], flo
         primitives = ["neutral"]
 
     mult = 1.0
-    if any(x in p for x in ["slight", "subtle", "a little"]):
-        mult *= 0.7
-    if "very" in p:
-        mult *= 1.3
-    if any(x in p for x in ["strong", "big", "exaggerated"]):
-        mult *= 1.5
+    for token, factor in intensity_multipliers.items():
+        if token in p:
+            mult *= float(factor)
 
-    weights = [DEFAULT_WEIGHTS.get(k, 1.0) * mult for k in primitives]
+    weights = [float(default_weights.get(k, 1.0)) * mult for k in primitives]
     return primitives, weights, mult
 
 
@@ -68,10 +77,23 @@ def main() -> None:
     ap.add_argument("--release_ratio", type=float, default=0.75)
     ap.add_argument("--latent_scale", type=float, default=1.0)
     ap.add_argument("--noise_scale", type=float, default=0.0)
+    ap.add_argument("--preset_config", type=Path, default=None)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
-    primitives, weights, mult = parse_prompt_to_primitives(args.prompt)
+    default_weights = dict(DEFAULT_WEIGHTS)
+    intensity_multipliers = dict(DEFAULT_INTENSITY_MULTIPLIERS)
+    if args.preset_config is not None:
+        cfg = json.loads(args.preset_config.read_text(encoding="utf-8"))
+        default_weights.update(cfg.get("default_weights", {}))
+        intensity_multipliers.update(cfg.get("intensity_multipliers", {}))
+        print(f"loaded preset config: {args.preset_config}")
+
+    primitives, weights, mult = parse_prompt_to_primitives(
+        args.prompt,
+        default_weights=default_weights,
+        intensity_multipliers=intensity_multipliers,
+    )
 
     prot = torch.load(args.prototype_path, map_location="cpu")
     label_map = prot["label_map"]

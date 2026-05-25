@@ -12,6 +12,7 @@ RUN_NAME="$2"
 PROTOTYPE_PATH="outputs/mmhead_debug/primitive_prototypes_v1/prototypes.pt"
 VAE_CHECKPOINT="outputs/mmhead_debug/vae_debug_beta1e4/best.pt"
 NORM_STATS="outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json"
+PRESET_CONFIG="motion_model/primitive_presets.json"
 NEUTRAL_TEMPLATE="assets/sample_motion/nersemble_seq_214_neutral"
 IMAGE_INPUT="assets/sample_input/mono_video/nersemble_seq_214.mp4"
 INFER_CONFIG="configs/inference/infer.yaml"
@@ -36,6 +37,7 @@ python motion_model/generate_from_text_rule.py \
   --prototype_path "${PROTOTYPE_PATH}" \
   --vae_checkpoint "${VAE_CHECKPOINT}" \
   --norm_stats "${NORM_STATS}" \
+  --preset_config "${PRESET_CONFIG}" \
   --output_npz "${NPZ_PATH}" \
   --target_len 64 \
   --output_len 32 \
