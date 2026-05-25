@@ -627,6 +627,12 @@ python motion_model/generate_composed_primitive.py \
   --norm_stats outputs/motion_dataset_v1/norm_stats.json \
   --output_npz outputs/primitive_labels_v1/gen_turn_left_smile_comp.npz \
   --target_len 64 \
+  --temporal_mode hold \
+  --output_len 32 \
+  --ramp_frames 10 \
+  --hold_frames 18 \
+  --release_frames 4 \
+  --release_ratio 0.75 \
   --latent_scale 1.0 \
   --noise_scale 0.0
 ```
