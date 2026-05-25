@@ -120,14 +120,47 @@ def prepare_output_layout(
         flame_src = neutral_template / "flame_param"
         if not flame_src.exists():
             raise SystemExit(f"missing flame_param in neutral_template: {neutral_template}")
-        shutil.copytree(flame_src, seq_dir / "flame_param")
+        seq_flame = seq_dir / "flame_param"
+        if seq_flame.exists() or seq_flame.is_symlink():
+            if seq_flame.is_symlink():
+                seq_flame.unlink()
+            else:
+                print(f"[WARN] existing real directory/file at {seq_flame}; keeping it untouched")
+        else:
+            seq_flame.symlink_to(flame_src.resolve(), target_is_directory=True)
 
         processed_src = neutral_template / "processed_data"
+        seq_processed = seq_dir / "processed_data"
         if processed_src.exists():
-            try:
-                (seq_dir / "processed_data").symlink_to(processed_src.resolve(), target_is_directory=True)
-            except OSError:
-                shutil.copytree(processed_src, seq_dir / "processed_data")
+            if seq_processed.exists() or seq_processed.is_symlink():
+                if seq_processed.is_symlink():
+                    seq_processed.unlink()
+                else:
+                    print(f"[WARN] existing real directory/file at {seq_processed}; keeping it untouched")
+            else:
+                seq_processed.symlink_to(processed_src.resolve(), target_is_directory=True)
+
+        # Create root-level symlinks expected by some FastAvatar paths:
+        # pack_root/flame_param -> pack_root/sequence_name/flame_param
+        # pack_root/processed_data -> pack_root/sequence_name/processed_data
+        root_flame = root_dir / "flame_param"
+        root_processed = root_dir / "processed_data"
+
+        for link_path, target_path, name in [
+            (root_flame, seq_flame, "flame_param"),
+            (root_processed, seq_processed, "processed_data"),
+        ]:
+            if link_path.exists() or link_path.is_symlink():
+                if link_path.is_symlink():
+                    link_path.unlink()
+                else:
+                    print(f"[WARN] existing real directory/file at {link_path}; keeping it untouched (not replaced)")
+                    continue
+            if target_path.exists():
+                try:
+                    link_path.symlink_to(target_path.resolve(), target_is_directory=True)
+                except OSError as e:
+                    print(f"[WARN] failed to create root symlink {name}: {e}")
         return seq_dir, root_dir, seq_name, copied_root_files
 
     if output_motion_root is not None:
@@ -246,6 +279,8 @@ def main() -> None:
             print(f"[FastAvatarPack] pack_root={output_root}")
             print(f"[FastAvatarPack] sequence_name={sequence_name}")
             print(f"[FastAvatarPack] inference_motion_dir={target_motion_dir}")
+            print(f"[FastAvatarPack] root_flame_param={output_root / 'flame_param'}")
+            print(f"[FastAvatarPack] root_processed_data={output_root / 'processed_data'}")
     else:
         print(f"[Write] output_motion_dir={target_motion_dir}")
     print(f"[Write] flame_param files updated={len(frame_paths)}")
