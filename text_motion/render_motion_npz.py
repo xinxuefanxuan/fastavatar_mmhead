@@ -94,7 +94,42 @@ def prepare_output_layout(
     sequence_name: str | None,
     overwrite: bool,
     motion_npz: Path,
+    fastavatar_pack: bool,
+    pack_root: Path | None,
 ) -> tuple[Path, Path | None, str | None, list[str]]:
+    if fastavatar_pack:
+        if pack_root is None:
+            raise SystemExit("--pack_root is required when --fastavatar_pack is used")
+        seq_name = sequence_name or motion_npz.stem
+        root_dir = pack_root
+        seq_dir = root_dir / seq_name
+        if root_dir.exists():
+            if not overwrite:
+                raise SystemExit(f"pack root exists: {root_dir}; use --overwrite")
+            shutil.rmtree(root_dir)
+        root_dir.mkdir(parents=True, exist_ok=True)
+
+        copied_root_files: list[str] = []
+        for name in ROOT_META_FILES:
+            src = neutral_template / name
+            if src.exists():
+                shutil.copy2(src, root_dir / name)
+                copied_root_files.append(name)
+
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        flame_src = neutral_template / "flame_param"
+        if not flame_src.exists():
+            raise SystemExit(f"missing flame_param in neutral_template: {neutral_template}")
+        shutil.copytree(flame_src, seq_dir / "flame_param")
+
+        processed_src = neutral_template / "processed_data"
+        if processed_src.exists():
+            try:
+                (seq_dir / "processed_data").symlink_to(processed_src.resolve(), target_is_directory=True)
+            except OSError:
+                shutil.copytree(processed_src, seq_dir / "processed_data")
+        return seq_dir, root_dir, seq_name, copied_root_files
+
     if output_motion_root is not None:
         seq_name = sequence_name or motion_npz.stem
         root_dir = output_motion_root
@@ -140,6 +175,8 @@ def main() -> None:
     ap.add_argument("--output_motion_dir", type=Path, default=None)
     ap.add_argument("--output_motion_root", type=Path, default=None)
     ap.add_argument("--sequence_name", type=str, default=None)
+    ap.add_argument("--fastavatar_pack", action="store_true")
+    ap.add_argument("--pack_root", type=Path, default=None)
     ap.add_argument("--motion_key", type=str, default="motion")
     ap.add_argument("--head_target", choices=["neck_pose", "rotation"], default="neck_pose")
     ap.add_argument("--smooth", action="store_true")
@@ -154,6 +191,8 @@ def main() -> None:
         sequence_name=args.sequence_name,
         overwrite=args.overwrite,
         motion_npz=args.motion_npz,
+        fastavatar_pack=args.fastavatar_pack,
+        pack_root=args.pack_root,
     )
     frame_paths, payloads = load_template_frames(target_motion_dir)
 
@@ -203,6 +242,10 @@ def main() -> None:
         print(f"[Write] sequence_name={sequence_name}")
         print(f"[Write] root metadata files={root_meta}")
         print(f"[Write] sequence_dir={target_motion_dir}")
+        if args.fastavatar_pack:
+            print(f"[FastAvatarPack] pack_root={output_root}")
+            print(f"[FastAvatarPack] sequence_name={sequence_name}")
+            print(f"[FastAvatarPack] inference_motion_dir={target_motion_dir}")
     else:
         print(f"[Write] output_motion_dir={target_motion_dir}")
     print(f"[Write] flame_param files updated={len(frame_paths)}")

@@ -421,6 +421,20 @@ python text_motion/render_motion_npz.py \
   --overwrite
 ```
 
+FastAvatar pack 模式（直接得到 `pack_root/sequence_name` 作为 infer motion 参数）：
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/mmhead_debug/motion_dataset_v1_debug/motions/CELEBVHQ_01ClRWyf9I4_0.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --fastavatar_pack \
+  --pack_root outputs/mmhead_debug/render_npz_pack \
+  --sequence_name CELEBVHQ_01ClRWyf9I4_0 \
+  --motion_key motion \
+  --head_target neck_pose \
+  --overwrite
+```
+
 ## P3.1 Motion Autoencoder（非VAE）
 
 先确保 P2.1 数据集已包含：
