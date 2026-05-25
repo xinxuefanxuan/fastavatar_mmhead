@@ -438,6 +438,7 @@ python text_motion/render_motion_npz.py \
 说明：`--fastavatar_pack` 会同时创建 root-level symlink，确保兼容 FastAvatar 的实际读取路径：  
 `pack_root/flame_param -> pack_root/sequence_name/flame_param`，  
 `pack_root/processed_data -> pack_root/sequence_name/processed_data`。  
+注意：pack 模式下 `sequence_name/flame_param` 必须是**真实目录**（脚本会复制模板帧并写入编辑后的 npz），绝不能把它 symlink 到 neutral template 的 `flame_param`，否则会污染模板。  
 
 ## P3.1 Motion Autoencoder（非VAE）
 

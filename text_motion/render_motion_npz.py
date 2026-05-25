@@ -122,12 +122,19 @@ def prepare_output_layout(
             raise SystemExit(f"missing flame_param in neutral_template: {neutral_template}")
         seq_flame = seq_dir / "flame_param"
         if seq_flame.exists() or seq_flame.is_symlink():
-            if seq_flame.is_symlink():
+            if overwrite and seq_flame.resolve().is_relative_to(root_dir.resolve()):
+                if seq_flame.is_symlink():
+                    seq_flame.unlink()
+                elif seq_flame.is_dir():
+                    shutil.rmtree(seq_flame)
+                else:
+                    seq_flame.unlink()
+            elif seq_flame.is_symlink():
                 seq_flame.unlink()
             else:
                 print(f"[WARN] existing real directory/file at {seq_flame}; keeping it untouched")
-        else:
-            seq_flame.symlink_to(flame_src.resolve(), target_is_directory=True)
+        if not seq_flame.exists():
+            shutil.copytree(flame_src, seq_flame)
 
         processed_src = neutral_template / "processed_data"
         seq_processed = seq_dir / "processed_data"
@@ -158,7 +165,7 @@ def prepare_output_layout(
                     continue
             if target_path.exists():
                 try:
-                    link_path.symlink_to(target_path.resolve(), target_is_directory=True)
+                    link_path.symlink_to(target_path, target_is_directory=True)
                 except OSError as e:
                     print(f"[WARN] failed to create root symlink {name}: {e}")
         return seq_dir, root_dir, seq_name, copied_root_files
@@ -276,11 +283,37 @@ def main() -> None:
         print(f"[Write] root metadata files={root_meta}")
         print(f"[Write] sequence_dir={target_motion_dir}")
         if args.fastavatar_pack:
+            root_flame = output_root / "flame_param"
+            resolved_root_flame = root_flame.resolve()
+            if "assets/sample_motion" in str(resolved_root_flame):
+                raise SystemExit(
+                    f"[ERROR] root flame_param resolves outside pack root and points to template: {resolved_root_flame}"
+                )
+            # post-write sanity stats from pack_root/flame_param
+            sanity_frames = sorted((output_root / "flame_param").glob("*.npz"))
+            if sanity_frames:
+                expr_norms = []
+                jaw_norms = []
+                yaw_vals = []
+                for fp in sanity_frames:
+                    d = np.load(fp, allow_pickle=True)
+                    expr = np.asarray(d["expr"], dtype=np.float32).reshape(-1)
+                    jaw = np.asarray(d["jaw_pose"], dtype=np.float32).reshape(-1)
+                    neck = np.asarray(d["neck_pose"], dtype=np.float32).reshape(-1)
+                    expr_norms.append(float(np.linalg.norm(expr)))
+                    jaw_norms.append(float(np.linalg.norm(jaw)))
+                    if neck.shape[0] >= 2:
+                        yaw_vals.append(float(neck[1]))
             print(f"[FastAvatarPack] pack_root={output_root}")
             print(f"[FastAvatarPack] sequence_name={sequence_name}")
             print(f"[FastAvatarPack] inference_motion_dir={target_motion_dir}")
             print(f"[FastAvatarPack] root_flame_param={output_root / 'flame_param'}")
             print(f"[FastAvatarPack] root_processed_data={output_root / 'processed_data'}")
+            print(f"[FastAvatarPack] root_flame_param_resolved={resolved_root_flame}")
+            if sanity_frames:
+                print(f"[FastAvatarPack] neck_pose_yaw min/max={min(yaw_vals):.6f}/{max(yaw_vals):.6f}" if yaw_vals else "[FastAvatarPack] neck_pose_yaw min/max=NA/NA")
+                print(f"[FastAvatarPack] expr norm mean/max={np.mean(expr_norms):.6f}/{np.max(expr_norms):.6f}")
+                print(f"[FastAvatarPack] jaw norm mean/max={np.mean(jaw_norms):.6f}/{np.max(jaw_norms):.6f}")
     else:
         print(f"[Write] output_motion_dir={target_motion_dir}")
     print(f"[Write] flame_param files updated={len(frame_paths)}")
