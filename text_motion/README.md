@@ -439,6 +439,13 @@ python text_motion/render_motion_npz.py \
 `pack_root/flame_param -> pack_root/sequence_name/flame_param`，  
 `pack_root/processed_data -> pack_root/sequence_name/processed_data`。  
 注意：pack 模式下 `sequence_name/flame_param` 必须是**真实目录**（脚本会复制模板帧并写入编辑后的 npz），绝不能把它 symlink 到 neutral template 的 `flame_param`，否则会污染模板。  
+最终布局（FastAvatar 兼容）：
+- `pack_root/canonical_flame_param.npz`
+- `pack_root/transforms*.json`
+- `pack_root/flame_param -> sequence_name/flame_param`（相对 symlink）
+- `pack_root/processed_data -> sequence_name/processed_data`（相对 symlink）
+- `pack_root/sequence_name/flame_param/*.npz`（真实目录，写入编辑后动作）
+- `pack_root/sequence_name/processed_data`（可为到模板的 symlink）
 
 ## P3.1 Motion Autoencoder（非VAE）
 

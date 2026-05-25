@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 from pathlib import Path
 
@@ -153,19 +154,27 @@ def prepare_output_layout(
         root_flame = root_dir / "flame_param"
         root_processed = root_dir / "processed_data"
 
-        for link_path, target_path, name in [
-            (root_flame, seq_flame, "flame_param"),
-            (root_processed, seq_processed, "processed_data"),
+        for link_path, rel_target, target_path, name in [
+            (root_flame, f"{seq_name}/flame_param", seq_flame, "flame_param"),
+            (root_processed, f"{seq_name}/processed_data", seq_processed, "processed_data"),
         ]:
             if link_path.exists() or link_path.is_symlink():
                 if link_path.is_symlink():
                     link_path.unlink()
                 else:
-                    print(f"[WARN] existing real directory/file at {link_path}; keeping it untouched (not replaced)")
-                    continue
+                    if overwrite and link_path.resolve().is_relative_to(root_dir.resolve()):
+                        if link_path.is_dir():
+                            shutil.rmtree(link_path)
+                        else:
+                            link_path.unlink()
+                    else:
+                        raise RuntimeError(
+                            f"existing real directory/file at {link_path}; "
+                            f"refusing to replace without safe --overwrite"
+                        )
             if target_path.exists():
                 try:
-                    link_path.symlink_to(target_path, target_is_directory=True)
+                    os.symlink(rel_target, link_path)
                 except OSError as e:
                     print(f"[WARN] failed to create root symlink {name}: {e}")
         return seq_dir, root_dir, seq_name, copied_root_files
@@ -314,6 +323,21 @@ def main() -> None:
                 print(f"[FastAvatarPack] neck_pose_yaw min/max={min(yaw_vals):.6f}/{max(yaw_vals):.6f}" if yaw_vals else "[FastAvatarPack] neck_pose_yaw min/max=NA/NA")
                 print(f"[FastAvatarPack] expr norm mean/max={np.mean(expr_norms):.6f}/{np.max(expr_norms):.6f}")
                 print(f"[FastAvatarPack] jaw norm mean/max={np.mean(jaw_norms):.6f}/{np.max(jaw_norms):.6f}")
+
+            root_flame_00000 = output_root / "flame_param" / "00000.npz"
+            seq_flame_00000 = output_root / sequence_name / "flame_param" / "00000.npz"
+            root_processed_data = output_root / "processed_data"
+            root_flame_resolved = (output_root / "flame_param").resolve()
+            print(f"[Validate] seq_flame_00000={seq_flame_00000}")
+            print(f"[Validate] root_flame_00000={root_flame_00000}")
+            print(f"[Validate] root_flame_resolved={root_flame_resolved}")
+            if not os.path.exists(seq_flame_00000):
+                raise RuntimeError(f"FastAvatar pack validation failed: missing {seq_flame_00000}")
+            if not os.path.exists(root_flame_00000):
+                raise RuntimeError(f"FastAvatar pack validation failed: missing {root_flame_00000}")
+            if not os.path.exists(root_processed_data):
+                raise RuntimeError(f"FastAvatar pack validation failed: missing {root_processed_data}")
+            print(f"[Validate] root_processed_data_resolved={root_processed_data.resolve()}")
     else:
         print(f"[Write] output_motion_dir={target_motion_dir}")
     print(f"[Write] flame_param files updated={len(frame_paths)}")
