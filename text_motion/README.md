@@ -638,3 +638,38 @@ python motion_model/generate_composed_primitive.py \
 ```
 
 输出 `npz` 与 `render_motion_npz.py` 兼容，并打印 expr/head/jaw 统计与 head yaw 的 min/max。
+
+## P5 Rule-based text-to-primitive generation
+
+将简单自然语言 prompt 映射到 primitive + 权重，再用与 P4.3 一致的 latent 组合与解码流程生成动作。
+
+```bash
+python motion_model/generate_from_text_rule.py \
+  --prompt "turn head left with a slight smile" \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_text_rule_left_smile.npz \
+  --target_len 64 \
+  --output_len 32 \
+  --temporal_mode hold \
+  --ramp_frames 10 \
+  --hold_frames 18 \
+  --release_frames 4 \
+  --release_ratio 0.75 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+规则映射（示例）：
+- left / turn left / look left → `turn_left`
+- right / turn right / look right → `turn_right`
+- nod / nodding → `nod`
+- smile / happy / grin → `smile`
+- open mouth / mouth open / jaw → `mouth_open`
+- neutral / still → `neutral`
+
+强度词倍率：
+- slight / subtle / a little → `0.7`
+- very → `1.3`
+- strong / big / exaggerated → `1.5`
