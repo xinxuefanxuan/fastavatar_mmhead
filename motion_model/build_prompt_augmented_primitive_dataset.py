@@ -10,6 +10,123 @@ from pathlib import Path
 import numpy as np
 
 
+SINGLE_TEMPLATES = {
+    "turn_left": [
+        "turn left",
+        "look left",
+        "look to the left",
+        "look toward the left",
+        "face left",
+        "turn your head left",
+        "rotate head left",
+        "glance left",
+        "slowly turn left",
+        "slightly turn left",
+        "make a left turn",
+        "move your head to the left",
+    ],
+    "turn_right": [
+        "turn right",
+        "look right",
+        "look to the right",
+        "look toward the right",
+        "face right",
+        "turn your head right",
+        "rotate head right",
+        "glance right",
+        "slowly turn right",
+        "slightly turn right",
+        "make a right turn",
+        "move your head to the right",
+    ],
+    "smile": [
+        "smile",
+        "smiling",
+        "make a smile",
+        "slight smile",
+        "big smile",
+        "happy smile",
+        "broad smile",
+        "grin",
+        "smile softly",
+        "smile happily",
+        "show a smile",
+    ],
+    "mouth_open": [
+        "open mouth",
+        "mouth open",
+        "open your mouth",
+        "jaw open",
+        "slightly open mouth",
+        "open the jaw",
+        "part the lips",
+        "lips parted",
+        "mouth slightly open",
+    ],
+    "nod": [
+        "nod",
+        "nodding",
+        "nod your head",
+        "move head up and down",
+        "slight nod",
+        "give a nod",
+        "gently nod",
+    ],
+    "neutral": [
+        "neutral",
+        "stay still",
+        "no motion",
+        "keep a neutral face",
+        "remain neutral",
+        "keep still",
+    ],
+}
+
+COMPOSE_TEMPLATES = {
+    ("turn_left", "smile"): [
+        "turn left and smile",
+        "smile while turning left",
+        "look left and smile",
+        "face left with a smile",
+        "turn your head left and smile",
+        "slowly turn left while smiling",
+        "slightly turn left and smile",
+    ],
+    ("turn_right", "smile"): [
+        "turn right and smile",
+        "smile while turning right",
+        "look right and smile",
+        "face right with a smile",
+        "turn your head right and smile",
+        "slowly turn right while smiling",
+        "slightly turn right and smile",
+    ],
+    ("mouth_open", "smile"): [
+        "smile with mouth open",
+        "open your mouth and smile",
+        "smile while opening mouth",
+        "happy open-mouth smile",
+        "grin with mouth open",
+    ],
+    ("nod", "smile"): [
+        "nod and smile",
+        "smile while nodding",
+        "nod your head and smile",
+        "gently nod with a smile",
+    ],
+    ("turn_left", "mouth_open"): [
+        "turn left and open mouth",
+        "look left with mouth open",
+        "open mouth while turning left",
+    ],
+    ("turn_right", "mouth_open"): [
+        "turn right and open mouth",
+        "look right with mouth open",
+        "open mouth while turning right",
+    ],
+}
+
+
 def read_jsonl(path: Path) -> list[dict]:
     rows: list[dict] = []
     with path.open("r", encoding="utf-8") as f:
@@ -17,10 +134,7 @@ def read_jsonl(path: Path) -> list[dict]:
             line = line.strip()
             if not line:
                 continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise SystemExit(f"invalid jsonl at {path}:{i}: {exc}")
+            rows.append(json.loads(line))
     return rows
 
 
@@ -31,18 +145,10 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def encode_texts(texts: list[str], encoder_name: str, device: str) -> np.ndarray:
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception as exc:
-        raise SystemExit(f"sentence-transformers is required: {exc}")
+    from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(encoder_name, device=device)
-    emb = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=False,
-        show_progress_bar=True,
-    )
+    emb = model.encode(texts, convert_to_numpy=True, normalize_embeddings=False, show_progress_bar=True)
     arr = np.asarray(emb, dtype=np.float32)
     if not np.isfinite(arr).all():
         raise SystemExit("embeddings contain NaN/Inf")
@@ -53,11 +159,11 @@ def stratified_split(items: list[dict], val_ratio: float, seed: int) -> tuple[li
     rng = random.Random(seed)
     by_label: dict[str, list[dict]] = defaultdict(list)
     for row in items:
-        by_label[row["labels"][0]].append(row)
+        key = row["labels"][0] if len(row["labels"]) == 1 else "+".join(sorted(row["labels"]))
+        by_label[key].append(row)
 
-    train: list[dict] = []
-    val: list[dict] = []
-    for label, rows in by_label.items():
+    train, val = [], []
+    for _, rows in by_label.items():
         rng.shuffle(rows)
         n = len(rows)
         n_val = int(round(n * val_ratio))
@@ -71,11 +177,20 @@ def stratified_split(items: list[dict], val_ratio: float, seed: int) -> tuple[li
 
 
 def count_label_vectors(rows: list[dict]) -> Counter[str]:
-    cnt: Counter[str] = Counter()
+    out: Counter[str] = Counter()
     for r in rows:
-        key = "+".join(sorted(r["labels"]))
-        cnt[key] += 1
-    return cnt
+        out["+".join(sorted(r["labels"]))] += 1
+    return out
+
+
+def make_variants(template: str, repeat: int) -> list[str]:
+    if repeat <= 1:
+        return [template]
+    variants = [template, f"please {template}", f"make the avatar {template}", f"the person should {template}"]
+    out = []
+    for i in range(repeat):
+        out.append(variants[i % len(variants)])
+    return out
 
 
 def main() -> None:
@@ -89,6 +204,10 @@ def main() -> None:
     ap.add_argument("--val_ratio", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max_real_per_label", type=int, default=450)
+    ap.add_argument("--synthetic_repeat", type=int, default=20)
+    ap.add_argument("--composition_repeat", type=int, default=30)
+    ap.add_argument("--synthetic_weight_mode", type=str, default="duplicate")
+    ap.add_argument("--include_direction_hard_negatives", action="store_true")
     ap.add_argument("--device", type=str, default="cuda")
     args = ap.parse_args()
 
@@ -96,14 +215,8 @@ def main() -> None:
     allowed = set(primitive_classes)
 
     labels_rows = read_jsonl(args.label_jsonl)
-    train_rows = read_jsonl(args.train_manifest)
-    val_rows = read_jsonl(args.val_manifest)
-
-    manifest_map: dict[str, dict] = {}
-    for r in train_rows + val_rows:
-        sid = str(r.get("sample_id", "")).strip()
-        if sid:
-            manifest_map[sid] = r
+    manifest_rows = read_jsonl(args.train_manifest) + read_jsonl(args.val_manifest)
+    manifest_map = {str(r.get("sample_id", "")).strip(): r for r in manifest_rows if str(r.get("sample_id", "")).strip()}
 
     real_by_label: dict[str, list[dict]] = defaultdict(list)
     missing_manifest = 0
@@ -130,59 +243,55 @@ def main() -> None:
         real_by_label[label].append(row)
 
     rng = random.Random(args.seed)
-    capped_real: list[dict] = []
+    capped_real = []
     for label in primitive_classes:
         rows = real_by_label.get(label, [])
         rng.shuffle(rows)
-        if args.max_real_per_label is not None and args.max_real_per_label > 0:
+        if args.max_real_per_label and args.max_real_per_label > 0:
             rows = rows[: args.max_real_per_label]
         capped_real.extend(rows)
-
     train_real, val_real = stratified_split(capped_real, args.val_ratio, args.seed)
 
-    single_templates = {
-        "turn_left": ["turn left", "look left", "look to the left", "face left", "turn your head left"],
-        "turn_right": ["turn right", "look right", "look to the right", "face right", "turn your head right"],
-        "smile": ["smile", "smiling", "make a smile", "slight smile", "big smile", "happy smile", "grin"],
-        "mouth_open": ["open mouth", "mouth open", "open your mouth", "jaw open"],
-        "nod": ["nod", "nodding", "nod your head", "move head up and down"],
-        "neutral": ["neutral", "stay still", "no motion", "keep a neutral face"],
-    }
-    multi_templates = {
-        ("turn_left", "smile"): ["turn left and smile", "smile while turning left", "look left and smile"],
-        ("turn_right", "smile"): ["turn right and smile", "smile while turning right", "look right and smile"],
-        ("mouth_open", "smile"): ["smile with mouth open", "open your mouth and smile"],
-        ("nod", "smile"): ["nod and smile", "smile while nodding"],
-    }
-
-    synthetic_rows: list[dict] = []
+    synthetic_rows = []
     sid_counter = 0
-    for label, texts in single_templates.items():
+
+    for label, templates in SINGLE_TEMPLATES.items():
         if label not in allowed:
             continue
-        for t in texts:
-            sid_counter += 1
-            synthetic_rows.append(
-                {
-                    "sample_id": f"synthetic_{label}_{sid_counter:04d}",
-                    "text": t,
+        for t in templates:
+            for text in make_variants(t, args.synthetic_repeat):
+                sid_counter += 1
+                synthetic_rows.append({
+                    "sample_id": f"synthetic_{label}_{sid_counter:06d}",
+                    "text": text,
                     "labels": [label],
                     "source": "synthetic",
-                }
-            )
-    for labels, texts in multi_templates.items():
+                })
+
+    for labels, templates in COMPOSE_TEMPLATES.items():
         if not set(labels).issubset(allowed):
             continue
-        for t in texts:
-            sid_counter += 1
-            synthetic_rows.append(
-                {
-                    "sample_id": f"synthetic_{'_'.join(labels)}_{sid_counter:04d}",
-                    "text": t,
+        for t in templates:
+            for text in make_variants(t, args.composition_repeat):
+                sid_counter += 1
+                synthetic_rows.append({
+                    "sample_id": f"synthetic_{'_'.join(labels)}_{sid_counter:06d}",
+                    "text": text,
                     "labels": list(labels),
                     "source": "synthetic",
-                }
-            )
+                })
+
+    if args.include_direction_hard_negatives:
+        pairs = [("turn left", "turn_left"), ("turn right", "turn_right"), ("look left", "turn_left"), ("look right", "turn_right"), ("face left", "turn_left"), ("face right", "turn_right")]
+        for text, label in pairs:
+            if label in allowed:
+                sid_counter += 1
+                synthetic_rows.append({
+                    "sample_id": f"synthetic_hardneg_{sid_counter:06d}",
+                    "text": text,
+                    "labels": [label],
+                    "source": "synthetic",
+                })
 
     train_syn, val_syn = stratified_split(synthetic_rows, args.val_ratio, args.seed + 7)
 
@@ -190,63 +299,59 @@ def main() -> None:
     final_val = val_real + val_syn
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    train_jsonl = args.output_dir / "train.jsonl"
-    val_jsonl = args.output_dir / "val.jsonl"
-    write_jsonl(train_jsonl, final_train)
-    write_jsonl(val_jsonl, final_val)
+    write_jsonl(args.output_dir / "train.jsonl", final_train)
+    write_jsonl(args.output_dir / "val.jsonl", final_val)
 
-    train_texts = [str(r.get("text", "")) for r in final_train]
-    val_texts = [str(r.get("text", "")) for r in final_val]
-    train_emb = encode_texts(train_texts, args.text_encoder, args.device)
-    val_emb = encode_texts(val_texts, args.text_encoder, args.device)
-
+    train_emb = encode_texts([r["text"] for r in final_train], args.text_encoder, args.device)
+    val_emb = encode_texts([r["text"] for r in final_val], args.text_encoder, args.device)
     if train_emb.shape[0] != len(final_train) or val_emb.shape[0] != len(final_val):
-        raise SystemExit("embedding row count mismatch with jsonl rows")
-
-    train_ids = [r["sample_id"] for r in final_train]
-    val_ids = [r["sample_id"] for r in final_val]
+        raise SystemExit("embedding row count mismatch")
 
     np.save(args.output_dir / "train_embeddings.npy", train_emb)
     np.save(args.output_dir / "val_embeddings.npy", val_emb)
-    (args.output_dir / "train_sample_ids.json").write_text(json.dumps(train_ids, ensure_ascii=False, indent=2), encoding="utf-8")
-    (args.output_dir / "val_sample_ids.json").write_text(json.dumps(val_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+    (args.output_dir / "train_sample_ids.json").write_text(json.dumps([r["sample_id"] for r in final_train], ensure_ascii=False, indent=2), encoding="utf-8")
+    (args.output_dir / "val_sample_ids.json").write_text(json.dumps([r["sample_id"] for r in final_val], ensure_ascii=False, indent=2), encoding="utf-8")
 
     train_label_dist = count_label_vectors(final_train)
     val_label_dist = count_label_vectors(final_val)
-
     train_source = Counter(r["source"] for r in final_train)
     val_source = Counter(r["source"] for r in final_val)
     train_multi = sum(1 for r in final_train if len(r["labels"]) > 1)
     val_multi = sum(1 for r in final_val if len(r["labels"]) > 1)
+    syn_single = sum(1 for r in synthetic_rows if len(r["labels"]) == 1)
+    syn_multi = sum(1 for r in synthetic_rows if len(r["labels"]) > 1)
 
     meta = {
         "primitive_classes": primitive_classes,
         "seed": args.seed,
         "val_ratio": args.val_ratio,
         "max_real_per_label": args.max_real_per_label,
+        "synthetic_repeat": args.synthetic_repeat,
+        "composition_repeat": args.composition_repeat,
+        "synthetic_weight_mode": args.synthetic_weight_mode,
+        "include_direction_hard_negatives": bool(args.include_direction_hard_negatives),
         "num_label_rows": len(labels_rows),
         "missing_manifest_count": missing_manifest,
+        "synthetic_single_label_examples": syn_single,
+        "synthetic_multi_label_examples": syn_multi,
         "train_count": len(final_train),
         "val_count": len(final_val),
         "train_source": dict(train_source),
         "val_source": dict(val_source),
-        "train_multilabel_count": int(train_multi),
-        "val_multilabel_count": int(val_multi),
+        "train_multilabel_count": train_multi,
+        "val_multilabel_count": val_multi,
         "train_label_distribution": dict(train_label_dist),
         "val_label_distribution": dict(val_label_dist),
-        "text_encoder": args.text_encoder,
-        "train_embeddings": str(args.output_dir / "train_embeddings.npy"),
-        "val_embeddings": str(args.output_dir / "val_embeddings.npy"),
     }
     (args.output_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[Build] train={len(final_train)} val={len(final_val)}")
     print(f"[Build] real/synthetic train={dict(train_source)} val={dict(val_source)}")
+    print(f"[Build] synthetic(single)={syn_single} synthetic(multi)={syn_multi}")
     print(f"[Build] multi-label train={train_multi} val={val_multi}")
     print(f"[Build] train label distribution={dict(train_label_dist)}")
     print(f"[Build] val label distribution={dict(val_label_dist)}")
     print(f"[Build] missing manifest rows from labels={missing_manifest}")
-    print(f"[Build] output_dir={args.output_dir}")
 
 
 if __name__ == "__main__":
