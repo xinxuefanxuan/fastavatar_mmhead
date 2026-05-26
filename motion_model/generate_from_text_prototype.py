@@ -16,8 +16,6 @@ class TextToPrototypeMLP(nn.Module):
     def forward(self,x):
         h=self.backbone(x); return self.logit_head(h),(self.res_head(h) if self.res_head is not None else None)
 
-def parse_csv(s): return [x.strip() for x in s.split(',') if x.strip()]
-
 def apply_topk_probs(probs, topk):
     if topk is None or topk<=0 or topk>=len(probs): return probs
     ix=np.argsort(-probs)[:topk]; out=np.zeros_like(probs); out[ix]=probs[ix]; s=out.sum(); return out/(s+1e-8)
@@ -30,8 +28,12 @@ def print_stats(m):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--prompt',type=str,required=True); ap.add_argument('--checkpoint',type=Path,required=True); ap.add_argument('--prototype_path',type=Path,required=True)
-    ap.add_argument('--vae_checkpoint',type=Path,required=True); ap.add_argument('--norm_stats',type=Path,required=True); ap.add_argument('--output_npz',type=Path,required=True)
+    ap.add_argument('--prompt',type=str,default='')
+    ap.add_argument('--checkpoint',type=Path,default=None)
+    ap.add_argument('--prototype_path',type=Path,required=True)
+    ap.add_argument('--vae_checkpoint',type=Path,required=True)
+    ap.add_argument('--norm_stats',type=Path,required=True)
+    ap.add_argument('--output_npz',type=Path,required=True)
     ap.add_argument('--encoder_name',type=str,default='/home/yuanyuhao/models/all-MiniLM-L6-v2'); ap.add_argument('--device',type=str,default='cuda')
     ap.add_argument('--temperature',type=float,default=1.0); ap.add_argument('--hard_top1',action='store_true'); ap.add_argument('--topk',type=int,default=None)
     ap.add_argument('--prototype_scales_json',type=Path,default=None); ap.add_argument('--latent_scale',type=float,default=1.0)
@@ -39,15 +41,20 @@ def main():
     ap.add_argument('--manual_weights_json',type=Path,default=None)
     args=ap.parse_args()
 
-    from sentence_transformers import SentenceTransformer
-    enc=SentenceTransformer(args.encoder_name,device=args.device)
-    emb=np.asarray(enc.encode([args.prompt],convert_to_numpy=True,normalize_embeddings=False),dtype=np.float32)[0]
+    if args.manual_weights_json is None and args.checkpoint is None:
+        raise SystemExit('Either --checkpoint or --manual_weights_json must be provided')
 
-    ck=torch.load(args.checkpoint,map_location=args.device)
-    primitive_classes=ck['primitive_classes']; c2i=ck.get('class_to_idx',{c:i for i,c in enumerate(primitive_classes)})
-    use_res=args.use_residual or bool(ck.get('use_residual',False))
-    model=TextToPrototypeMLP(int(ck['embedding_dim']),int(ck['latent_dim']),len(primitive_classes),int(ck.get('args',{}).get('hidden_dim',512)),int(ck.get('args',{}).get('num_layers',3)),float(ck.get('args',{}).get('dropout',0.1)),use_residual=use_res).to(args.device)
-    model.load_state_dict(ck['model']); model.eval()
+    primitive_classes=None; c2i=None; res=None
+    if args.checkpoint is not None:
+        ck=torch.load(args.checkpoint,map_location=args.device)
+        primitive_classes=ck['primitive_classes']; c2i=ck.get('class_to_idx',{c:i for i,c in enumerate(primitive_classes)})
+    else:
+        # infer primitive classes from prototype label map for manual mode
+        prot0=torch.load(args.prototype_path,map_location='cpu')
+        primitive_classes=list(prot0.get('label_map',{}).keys())
+        if not primitive_classes:
+            primitive_classes=list(prot0['label_to_mean_mu'].keys())
+        c2i={c:i for i,c in enumerate(primitive_classes)}
 
     prot=torch.load(args.prototype_path,map_location='cpu')
     zbank=np.stack([np.asarray(prot['label_to_mean_mu'][c],dtype=np.float32) for c in primitive_classes],0)
@@ -57,26 +64,46 @@ def main():
         for i,c in enumerate(primitive_classes):
             if c in cfg: scales[i]=float(cfg[c])
 
-    with torch.no_grad():
-        logits,res=model(torch.from_numpy(emb[None,...]).to(args.device))
-    probs=torch.softmax(logits[0]/max(args.temperature,1e-6),dim=0).detach().cpu().numpy()
-    probs=apply_topk_probs(probs,args.topk)
-    if args.hard_top1:
-        i=int(np.argmax(probs)); hp=np.zeros_like(probs); hp[i]=1.0; probs=hp
-
-    if args.manual_weights_json is not None:
+    if args.manual_weights_json is not None and args.checkpoint is None:
+        probs=np.zeros((len(primitive_classes),),dtype=np.float32)
         mw=json.loads(args.manual_weights_json.read_text(encoding='utf-8'))
-        probs=np.zeros_like(probs)
         for k,v in mw.items():
             if k in c2i: probs[c2i[k]]=float(v)
-        s=probs.sum(); probs=probs/(s+1e-8)
-        print('[ManualWeights] enabled')
+        s=float(probs.sum())
+        if s<=0: raise RuntimeError('manual_weights_json produced zero sum weights')
+        probs=probs/(s+1e-8)
+        print('[ManualWeights] checkpoint-free mode enabled')
+    else:
+        from sentence_transformers import SentenceTransformer
+        if args.prompt.strip()=='' and args.manual_weights_json is None:
+            raise SystemExit('--prompt is required when manual weights are not provided')
+        enc=SentenceTransformer(args.encoder_name,device=args.device)
+        emb=np.asarray(enc.encode([args.prompt],convert_to_numpy=True,normalize_embeddings=False),dtype=np.float32)[0]
 
-    ni=primitive_classes.index('neutral'); z_neutral=zbank[ni]
+        use_res=args.use_residual or bool(ck.get('use_residual',False))
+        model=TextToPrototypeMLP(int(ck['embedding_dim']),int(ck['latent_dim']),len(primitive_classes),int(ck.get('args',{}).get('hidden_dim',512)),int(ck.get('args',{}).get('num_layers',3)),float(ck.get('args',{}).get('dropout',0.1)),use_residual=use_res).to(args.device)
+        model.load_state_dict(ck['model']); model.eval()
+        with torch.no_grad():
+            logits,res=model(torch.from_numpy(emb[None,...]).to(args.device))
+        probs=torch.softmax(logits[0]/max(args.temperature,1e-6),dim=0).detach().cpu().numpy()
+        probs=apply_topk_probs(probs,args.topk)
+        if args.hard_top1:
+            i=int(np.argmax(probs)); hp=np.zeros_like(probs); hp[i]=1.0; probs=hp
+        if args.manual_weights_json is not None:
+            mw=json.loads(args.manual_weights_json.read_text(encoding='utf-8'))
+            probs=np.zeros_like(probs)
+            for k,v in mw.items():
+                if k in c2i: probs[c2i[k]]=float(v)
+            s=probs.sum(); probs=probs/(s+1e-8)
+            print('[ManualWeights] enabled (override predicted probs)')
+
+    if 'neutral' not in c2i:
+        raise RuntimeError('prototype classes must include neutral')
+    ni=c2i['neutral']; z_neutral=zbank[ni]
     dirs=(zbank-z_neutral[None,:])*(scales[:,None])
     z_proto=z_neutral + probs @ dirs
     z_final=z_proto.copy()
-    if res is not None and use_res:
+    if res is not None and args.use_residual:
         z_final = z_final + float(args.residual_scale)*res[0].detach().cpu().numpy()
     z_final = z_final * float(args.latent_scale)
 
