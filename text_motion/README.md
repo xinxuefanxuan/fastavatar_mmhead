@@ -733,3 +733,5 @@ python motion_model/generate_from_text_prototype.py \
   --encoder_name /home/yuanyuhao/models/all-MiniLM-L6-v2 \
   --device cuda
 ```
+
+- Note: in `generate_from_text_prototype.py`, `--manual_weights_json` uses raw amplitude coefficients by default (P5-compatible). Use `--normalize_manual_weights` only for debugging experiments.

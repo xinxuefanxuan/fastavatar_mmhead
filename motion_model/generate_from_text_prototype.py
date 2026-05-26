@@ -39,6 +39,7 @@ def main():
     ap.add_argument('--prototype_scales_json',type=Path,default=None); ap.add_argument('--latent_scale',type=float,default=1.0)
     ap.add_argument('--use_residual',action='store_true'); ap.add_argument('--residual_scale',type=float,default=0.1)
     ap.add_argument('--manual_weights_json',type=Path,default=None)
+    ap.add_argument('--normalize_manual_weights',action='store_true', help='Only for manual mode debug; default False to match P5 raw amplitude weights')
     args=ap.parse_args()
 
     if args.manual_weights_json is None and args.checkpoint is None:
@@ -64,14 +65,22 @@ def main():
         for i,c in enumerate(primitive_classes):
             if c in cfg: scales[i]=float(cfg[c])
 
+    latent_key='label_to_mean_mu'
+    print(f'[PrototypeDebug] latent_key={latent_key}')
+
     if args.manual_weights_json is not None and args.checkpoint is None:
         probs=np.zeros((len(primitive_classes),),dtype=np.float32)
         mw=json.loads(args.manual_weights_json.read_text(encoding='utf-8'))
+        print(f'[ManualWeights] raw_weights={mw}')
         for k,v in mw.items():
             if k in c2i: probs[c2i[k]]=float(v)
-        s=float(probs.sum())
-        if s<=0: raise RuntimeError('manual_weights_json produced zero sum weights')
-        probs=probs/(s+1e-8)
+        if args.normalize_manual_weights:
+            s=float(probs.sum())
+            if s<=0: raise RuntimeError('manual_weights_json produced zero sum weights')
+            probs=probs/(s+1e-8)
+        print('[ManualWeights] checkpoint-free mode enabled')
+        print(f'[ManualWeights] normalize_manual_weights={args.normalize_manual_weights}')
+        print('[ManualWeights] final_weights=' + json.dumps({primitive_classes[i]:float(probs[i]) for i in range(len(primitive_classes))}, ensure_ascii=False))
         print('[ManualWeights] checkpoint-free mode enabled')
     else:
         from sentence_transformers import SentenceTransformer
@@ -91,21 +100,34 @@ def main():
             i=int(np.argmax(probs)); hp=np.zeros_like(probs); hp[i]=1.0; probs=hp
         if args.manual_weights_json is not None:
             mw=json.loads(args.manual_weights_json.read_text(encoding='utf-8'))
+            print(f'[ManualWeights] raw_weights={mw}')
             probs=np.zeros_like(probs)
             for k,v in mw.items():
                 if k in c2i: probs[c2i[k]]=float(v)
-            s=probs.sum(); probs=probs/(s+1e-8)
+            if args.normalize_manual_weights:
+                s=float(probs.sum())
+                if s<=0: raise RuntimeError('manual_weights_json produced zero sum weights')
+                probs=probs/(s+1e-8)
             print('[ManualWeights] enabled (override predicted probs)')
+            print(f'[ManualWeights] normalize_manual_weights={args.normalize_manual_weights}')
+            print('[ManualWeights] final_weights=' + json.dumps({primitive_classes[i]:float(probs[i]) for i in range(len(primitive_classes))}, ensure_ascii=False))
 
     if 'neutral' not in c2i:
         raise RuntimeError('prototype classes must include neutral')
     ni=c2i['neutral']; z_neutral=zbank[ni]
+    print(f'[PrototypeDebug] neutral_norm={float(np.linalg.norm(z_neutral)):.6f}')
     dirs=(zbank-z_neutral[None,:])*(scales[:,None])
+    for i,cls in enumerate(primitive_classes):
+        pnorm=float(np.linalg.norm(zbank[i]))
+        dnorm=float(np.linalg.norm(zbank[i]-z_neutral))
+        w=float(probs[i])
+        print(f'[PrototypeDebug] class={cls} prototype_norm={pnorm:.6f} delta_norm_to_neutral={dnorm:.6f} weight={w:.6f} weighted_delta_norm={abs(w)*dnorm:.6f}')
     z_proto=z_neutral + probs @ dirs
     z_final=z_proto.copy()
     if res is not None and args.use_residual:
         z_final = z_final + float(args.residual_scale)*res[0].detach().cpu().numpy()
     z_final = z_final * float(args.latent_scale)
+    print(f'[PrototypeDebug] final_z_norm={float(np.linalg.norm(z_final)):.6f}')
 
     vck=torch.load(args.vae_checkpoint,map_location=args.device)
     vae=TemporalConvVAE(in_dim=56,latent_dim=int(vck.get('args',{}).get('latent_dim',64))).to(args.device)
