@@ -25,7 +25,7 @@ def apply_topk(scores,topk):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--prompt',type=str,required=True); ap.add_argument('--checkpoint',type=Path,required=True)
+    ap.add_argument('--prompt',type=str,required=True); ap.add_argument('--checkpoint',type=Path,default=None)
     ap.add_argument('--prototype_path',type=Path,required=True); ap.add_argument('--vae_checkpoint',type=Path,required=True); ap.add_argument('--norm_stats',type=Path,required=True)
     ap.add_argument('--prototype_scales_json',type=Path,default=Path('outputs/mmhead_debug/text_prototype_debug/prototype_scales_calibrated.json'))
     ap.add_argument('--output_npz',type=Path,required=True); ap.add_argument('--encoder_name',type=str,default='/home/yuanyuhao/models/all-MiniLM-L6-v2')
@@ -33,12 +33,23 @@ def main():
     ap.add_argument('--manual_weights_json',type=Path,default=None)
     args=ap.parse_args()
 
-    ck=torch.load(args.checkpoint,map_location=args.device)
-    classes=ck['primitive_classes']; c2i=ck.get('class_to_idx',{c:i for i,c in enumerate(classes)})
-    model=MLP(int(ck['embedding_dim']),len(classes),int(ck.get('args',{}).get('hidden_dim',512)),int(ck.get('args',{}).get('num_layers',3)),float(ck.get('args',{}).get('dropout',0.1))).to(args.device)
-    model.load_state_dict(ck['model']); model.eval()
+    if args.manual_weights_json is None and args.checkpoint is None:
+        raise ValueError('Either --checkpoint or --manual_weights_json must be provided.')
+
+    classes=None
+    c2i=None
+    model=None
+    if args.checkpoint is not None:
+        ck=torch.load(args.checkpoint,map_location=args.device)
+        classes=ck['primitive_classes']
+        c2i=ck.get('class_to_idx',{c:i for i,c in enumerate(classes)})
+        model=MLP(int(ck['embedding_dim']),len(classes),int(ck.get('args',{}).get('hidden_dim',512)),int(ck.get('args',{}).get('num_layers',3)),float(ck.get('args',{}).get('dropout',0.1))).to(args.device)
+        model.load_state_dict(ck['model']); model.eval()
 
     prot=torch.load(args.prototype_path,map_location='cpu')
+    if classes is None:
+        classes=list(prot['label_to_mean_mu'].keys())
+        c2i={c:i for i,c in enumerate(classes)}
     zbank=np.stack([np.asarray(prot['label_to_mean_mu'][c],dtype=np.float32) for c in classes],0)
     scales=np.ones((len(classes),),dtype=np.float32)
     if args.prototype_scales_json is not None and args.prototype_scales_json.exists():
