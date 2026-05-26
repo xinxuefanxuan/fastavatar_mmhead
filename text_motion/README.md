@@ -699,3 +699,37 @@ python motion_model/generate_from_text_rule.py \
 - slight / subtle / a little → `0.7`
 - very → `1.3`
 - strong / big / exaggerated → `1.5`
+
+
+## P6.5 Text-to-Prototype latent baseline
+
+Train:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_text_to_prototype.py \
+  --train_manifest outputs/mmhead_debug/motion_dataset_v1_ae_debug/train.jsonl \
+  --val_manifest outputs/mmhead_debug/motion_dataset_v1_ae_debug/val.jsonl \
+  --text_embeddings_dir outputs/mmhead_debug/text_embeddings_v1 \
+  --label_jsonl outputs/mmhead_debug/primitive_labels_v2/all_labeled_normalized.jsonl \
+  --label_field label \
+  --prototype_path outputs/mmhead_debug/primitive_prototypes_v1/prototypes.pt \
+  --vae_checkpoint outputs/mmhead_debug/vae_debug_beta1e4/best.pt \
+  --norm_stats outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json \
+  --output_dir outputs/mmhead_debug/text_to_prototype_v1 \
+  --primitive_classes neutral,turn_left,turn_right,nod,smile,mouth_open \
+  --latent_dim 64 --hidden_dim 512 --num_layers 3 \
+  --batch_size 128 --epochs 100 --lr 1e-4 --device cuda \
+  --max_per_label 450 --balanced_sampler --eval_every 10
+```
+
+Generate:
+```bash
+python motion_model/generate_from_text_prototype.py \
+  --prompt "turn left and smile" \
+  --checkpoint outputs/mmhead_debug/text_to_prototype_v1/best.pt \
+  --prototype_path outputs/mmhead_debug/primitive_prototypes_v1/prototypes.pt \
+  --vae_checkpoint outputs/mmhead_debug/vae_debug_beta1e4/best.pt \
+  --norm_stats outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json \
+  --output_npz outputs/mmhead_debug/text_prototype_generated/turn_left_smile.npz \
+  --encoder_name /home/yuanyuhao/models/all-MiniLM-L6-v2 \
+  --device cuda
+```
