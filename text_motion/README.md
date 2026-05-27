@@ -735,3 +735,46 @@ python motion_model/generate_from_text_prototype.py \
 ```
 
 - Note: in `generate_from_text_prototype.py`, `--manual_weights_json` uses raw amplitude coefficients by default (P5-compatible). Use `--normalize_manual_weights` only for debugging experiments.
+
+## P7.1 Channel-wise VAE reconstruction
+
+Train expr channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel expr \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/expr \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Train head channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel head \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/head \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Train jaw channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel jaw \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/jaw \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Reconstruct with three channel VAEs:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/reconstruct_with_channel_vaes.py \
+  --input_npz outputs/mmhead_debug/text_prototype_multilabel_v2_generated_best/turn_left_and_smile.npz \
+  --expr_checkpoint outputs/mmhead_debug/channel_vae_v1/expr/best.pt \
+  --head_checkpoint outputs/mmhead_debug/channel_vae_v1/head/best.pt \
+  --jaw_checkpoint outputs/mmhead_debug/channel_vae_v1/jaw/best.pt \
+  --output_npz outputs/mmhead_debug/channel_vae_v1/recon/turn_left_and_smile_recon.npz \
+  --device cuda
+```
