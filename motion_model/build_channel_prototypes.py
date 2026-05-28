@@ -9,6 +9,7 @@ from motion_model.channel_vae import ChannelTemporalVAE
 
 CH_SLICE={"expr":(0,50),"head":(50,53),"jaw":(53,56)}
 
+
 def read_jsonl(p:Path):
     out=[]
     with p.open('r',encoding='utf-8') as f:
@@ -35,6 +36,14 @@ def load_model(ckpt,device):
     m.load_state_dict(c['model']);m.eval()
     return m
 
+def encode_channels(models,mn,dev):
+    out={}
+    for ch,(s,e) in CH_SLICE.items():
+        x=torch.from_numpy(mn[:,s:e][None].astype(np.float32)).to(dev)
+        with torch.no_grad(): mu,_=models[ch].encode(x)
+        out[ch]=mu[0].cpu()
+    return out
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--label_jsonl',type=Path,default=Path('outputs/mmhead_debug/primitive_labels_v2/all_labeled_normalized.jsonl'))
@@ -49,6 +58,9 @@ def main():
     ap.add_argument('--max_per_label',type=int,default=450)
     ap.add_argument('--target_len',type=int,default=64)
     ap.add_argument('--device',type=str,default='cuda')
+    ap.add_argument('--prototype_strategy',type=str,choices=['real_mean','teacher_npz','hybrid'],default='real_mean')
+    ap.add_argument('--teacher_npz_map_json',type=Path,default=None)
+    ap.add_argument('--neutral_strategy',type=str,choices=['zero_motion','real_mean','low_motion'],default='zero_motion')
     args=ap.parse_args()
     dev=torch.device(args.device if torch.cuda.is_available() or args.device=='cpu' else 'cpu')
 
@@ -63,49 +75,72 @@ def main():
     counts=defaultdict(int)
     motion_energy=[]
 
-    for r in labels:
-        sid=str(r.get('sample_id','')); lab=str(r.get('label',''))
-        if lab not in classes: continue
-        if counts[lab]>=args.max_per_label: continue
-        mr=m_map.get(sid); 
-        if mr is None: continue
-        p=mr.get('npz_path') or mr.get('motion_path')
-        if not p or not Path(p).exists(): continue
-        mn=load_motion_norm(Path(p),mean,std,args.target_len)
-        motion_energy.append((float(np.linalg.norm(mn,axis=1).mean()),mn))
-        for ch,(s,e) in CH_SLICE.items():
-            x=torch.from_numpy(mn[:,s:e][None].astype(np.float32)).to(dev)
-            with torch.no_grad(): mu,_=models[ch].encode(x)
-            feats[ch][lab].append(mu[0].cpu())
-        counts[lab]+=1
+    use_real = args.prototype_strategy in ('real_mean','hybrid')
+    if use_real:
+        for r in labels:
+            sid=str(r.get('sample_id','')); lab=str(r.get('label',''))
+            if lab not in classes: continue
+            if counts[lab]>=args.max_per_label: continue
+            mr=m_map.get(sid)
+            if mr is None: continue
+            p=mr.get('npz_path') or mr.get('motion_path')
+            if not p or not Path(p).exists(): continue
+            mn=load_motion_norm(Path(p),mean,std,args.target_len)
+            motion_energy.append((float(np.linalg.norm(mn,axis=1).mean()),mn))
+            zs=encode_channels(models,mn,dev)
+            for ch in CH_SLICE: feats[ch][lab].append(zs[ch])
+            counts[lab]+=1
 
-    # neutral fallback by low-motion samples
-    neutral_sparse = len(feats['expr'].get('neutral',[]))<5
-    if neutral_sparse and motion_energy:
+    teacher_map={}
+    if args.teacher_npz_map_json and args.teacher_npz_map_json.exists():
+        teacher_map=json.loads(args.teacher_npz_map_json.read_text())
+
+    if args.prototype_strategy in ('teacher_npz','hybrid'):
+        for lab,p in teacher_map.items():
+            if lab not in classes: continue
+            pp=Path(p)
+            if not pp.exists(): continue
+            mn=load_motion_norm(pp,mean,std,args.target_len)
+            zs=encode_channels(models,mn,dev)
+            for ch in CH_SLICE:
+                if args.prototype_strategy=='teacher_npz': feats[ch][lab]=[zs[ch]]
+                else: feats[ch][lab].append(zs[ch])
+            counts[lab]=max(counts[lab],1)
+
+    # neutral prototype
+    if args.neutral_strategy=='zero_motion':
+        zraw=np.zeros((args.target_len,56),np.float32)
+        znorm=(zraw-mean[None,:56])/np.maximum(std[None,:56],1e-8)
+        zs=encode_channels(models,znorm,dev)
+        for ch in CH_SLICE: feats[ch]['neutral']=[zs[ch]]
+    elif args.neutral_strategy=='low_motion' and motion_energy:
         motion_energy.sort(key=lambda x:x[0])
         low=[m for _,m in motion_energy[:min(50,len(motion_energy))]]
         for mn in low:
-            for ch,(s,e) in CH_SLICE.items():
-                x=torch.from_numpy(mn[:,s:e][None].astype(np.float32)).to(dev)
-                with torch.no_grad(): mu,_=models[ch].encode(x)
-                feats[ch]['neutral'].append(mu[0].cpu())
+            zs=encode_channels(models,mn,dev)
+            for ch in CH_SLICE: feats[ch]['neutral'].append(zs[ch])
 
     prot={ch:{} for ch in ['expr','head','jaw']}
     for ch in prot:
         for lab in classes:
             arr=feats[ch].get(lab,[])
-            if arr:
-                z=torch.stack(arr,0).mean(0)
-            else:
-                z=torch.zeros(models[ch].latent_dim)
+            z=torch.stack(arr,0).mean(0) if arr else torch.zeros(models[ch].latent_dim)
             prot[ch][lab]=z
-            print(f"[{ch}] {lab}: count={len(arr)} norm={z.norm().item():.6f}")
+
+    for ch in ['expr','head','jaw']:
+        neutral=prot[ch]['neutral']
+        for lab in classes:
+            z=prot[ch][lab]; d=(z-neutral).norm().item()
+            print(f"[{ch}] {lab}: count={len(feats[ch].get(lab,[]))} z_norm={z.norm().item():.6f} delta_to_neutral={d:.6f}")
 
     out={
         'primitive_classes':classes,
         'channels':['expr','head','jaw'],
         'prototypes':prot,
         'counts':dict(counts),
+        'prototype_strategy':args.prototype_strategy,
+        'teacher_npz_map':teacher_map,
+        'neutral_strategy':args.neutral_strategy,
         'channel_vae_checkpoints':{'expr':str(args.expr_checkpoint),'head':str(args.head_checkpoint),'jaw':str(args.jaw_checkpoint)},
         'target_len':args.target_len,
     }
