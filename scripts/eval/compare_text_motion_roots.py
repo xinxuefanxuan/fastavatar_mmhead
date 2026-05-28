@@ -41,6 +41,24 @@ def parse_roots(items: list[str]) -> dict[str, Path]:
     return roots
 
 
+def to_json_safe(obj):
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
 def find_file(root: Path, task: str) -> Path | None:
     for stem in ALIASES[task]:
         p = root / f"{stem}.npz"
@@ -359,8 +377,14 @@ def main():
     results = {name: evaluate_root(path, args.motion_key, args) for name, path in roots.items()}
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    payload = to_json_safe({
+        "roots": roots,
+        "args": vars(args),
+        "results": results,
+    })
+    print("[Compare] serializing JSON-safe detailed metrics")
     (args.output_dir / "detailed_metrics.json").write_text(
-        json.dumps({"roots": {k: str(v) for k, v in roots.items()}, "args": vars(args), "results": results}, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     write_csv_summary(args.output_dir / "per_method_summary.csv", results)
