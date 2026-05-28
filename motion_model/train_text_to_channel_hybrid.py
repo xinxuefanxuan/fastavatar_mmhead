@@ -28,13 +28,31 @@ class DS(Dataset):
             if sid in id2i: keep.append((r,id2i[sid]))
         self.rows=[x[0] for x in keep]; self.idxs=[x[1] for x in keep]
         self.classes=classes
+        src_cnt={}; missing_path=0
+        for r in self.rows:
+            s=r.get('source','synthetic')
+            src_cnt[s]=src_cnt.get(s,0)+1
+            p=r.get('npz_path') or r.get('motion_path') or ""
+            if not p: missing_path+=1
+        print(f"[Dataset] split={split} rows={len(self.rows)}")
+        print(f"[Dataset] split={split} source_distribution={src_cnt}")
+        print(f"[Dataset] split={split} missing_path={missing_path} available_path={len(self.rows)-missing_path}")
     def __len__(self): return len(self.rows)
     def __getitem__(self,i):
         r=self.rows[i]; x=self.emb[self.idxs[i]]
         y=np.zeros((len(self.classes),),np.float32)
         for j,c in enumerate(self.classes):
             if c in r.get('labels',[]): y[j]=1.0
-        return torch.from_numpy(x), torch.from_numpy(y), r.get('source','synthetic'), r.get('npz_path') or r.get('motion_path')
+        path = r.get('npz_path') or r.get('motion_path') or ""
+        return torch.from_numpy(x), torch.from_numpy(y), r.get('source','synthetic'), path
+
+def hybrid_collate_fn(batch):
+    xs, ys, srcs, paths = zip(*batch)
+    xs = torch.stack(xs, dim=0)
+    ys = torch.stack(ys, dim=0)
+    srcs = list(srcs)
+    paths = [p if p is not None else "" for p in paths]
+    return xs, ys, srcs, paths
 
 class HybridNet(nn.Module):
     def __init__(self,in_dim,n_cls,expr_d,head_d,jaw_d,h=512,layers=3,drop=0.1):
@@ -121,7 +139,8 @@ def main():
             for k,v in cfg.get(ch,{}).items(): scales[ch][k]=float(v)
 
     trds=DS(args.dataset_dir,'train',classes); vads=DS(args.dataset_dir,'val',classes)
-    tr=DataLoader(trds,batch_size=args.batch_size,shuffle=True); va=DataLoader(vads,batch_size=args.batch_size)
+    tr=DataLoader(trds,batch_size=args.batch_size,shuffle=True,collate_fn=hybrid_collate_fn)
+    va=DataLoader(vads,batch_size=args.batch_size,collate_fn=hybrid_collate_fn)
 
     expr_m,eck=load_cvae(args.expr_checkpoint,dev); head_m,hck=load_cvae(args.head_checkpoint,dev); jaw_m,jck=load_cvae(args.jaw_checkpoint,dev)
     cvaes={'expr':expr_m,'head':head_m,'jaw':jaw_m}
@@ -150,7 +169,13 @@ def main():
                 'jaw': z_proto_pred['jaw']  + args.residual_scale*out['g_jaw'] *out['r_jaw'],
             }
             # target latent uses real if available
-            real=encode_real_targets(paths,cvaes,mean,std,int(eck['target_len']),dev)
+            safe_paths=[]
+            for s,p in zip(src,paths):
+                if s=='real' and isinstance(p,str) and p and Path(p).exists():
+                    safe_paths.append(p)
+                else:
+                    safe_paths.append("")
+            real=encode_real_targets(safe_paths,cvaes,mean,std,int(eck['target_len']),dev)
             zt={k:z_proto_tgt[k].clone() for k in z_proto_tgt}
             for i,r in enumerate(real):
                 if r is not None and src[i]=='real':
