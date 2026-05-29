@@ -8,19 +8,44 @@ from sentence_transformers import SentenceTransformer
 from motion_model.channel_vae import ChannelTemporalVAE
 from motion_model.train_text_to_channel_hybrid import HybridNet, DEFAULT_SCALES
 
+NEW_HEAD_PRIMITIVES = ['look_up', 'look_down', 'tilt_left', 'tilt_right']
+
 
 def load_cvae(ckpt,dev):
     c=torch.load(ckpt,map_location=dev)
     m=ChannelTemporalVAE(int(c['input_dim']),int(c['target_len']),int(c['latent_dim']),int(c['hidden_dim'])).to(dev)
     m.load_state_dict(c['model']);m.eval(); return m,c
 
-def compose(scores, classes, protos, scales, dev):
+def default_scale_for_label(ch, label, protos):
+    if label in scales_global_for_lookup.get(ch, {}):
+        return float(scales_global_for_lookup[ch][label])
+    if ch == 'head' and label in protos.get('head', {}) and 'neutral' in protos.get('head', {}):
+        delta = protos['head'][label] - protos['head']['neutral']
+        if float(delta.norm().item()) > 1e-6:
+            return 1.0
+    return 0.0
+
+
+# Assigned in main after channel scales are loaded; kept module-level so compose can use
+# a single helper for learned and manual modes.
+scales_global_for_lookup = {}
+
+
+def compose(scores, classes, protos, scales, dev, debug_labels=None):
     B=scores.shape[0]; out={}
+    active = set(debug_labels or [])
     for ch in ['expr','head','jaw']:
         z0=protos[ch]['neutral'].to(dev)
         z=z0[None,:].repeat(B,1)
         for i,c in enumerate(classes):
-            z = z + scores[:,i:i+1]*float(scales[ch].get(c,0.0))*(protos[ch][c].to(dev)-z0)[None,:]
+            if c not in protos[ch]:
+                continue
+            scale = float(scales[ch].get(c, default_scale_for_label(ch, c, protos)))
+            dz=(protos[ch][c].to(dev)-z0)[None,:]
+            weighted=scores[:,i:i+1]*scale*dz
+            z = z + weighted
+            if c in active:
+                print(f"[ProtoDebug] channel={ch} label={c} scale={scale:.6f} delta_to_neutral={float(dz.norm().item()):.6f} weighted_delta_norm={float(weighted.norm().item()):.6f}")
         out[ch]=z
     return out
 
@@ -54,10 +79,16 @@ def main():
     cp=torch.load(args.channel_prototypes,map_location='cpu'); classes=cp['primitive_classes']
     protos={ch:{k:v.float() for k,v in cp['prototypes'][ch].items()} for ch in ['expr','head','jaw']}
     scales={k:v.copy() for k,v in DEFAULT_SCALES.items()}
+    for lab in NEW_HEAD_PRIMITIVES:
+        scales.setdefault('head', {})[lab] = 1.0
+        scales.setdefault('expr', {})[lab] = 0.0
+        scales.setdefault('jaw', {})[lab] = 0.0
     if args.manual_channel_weights_json and args.manual_channel_weights_json.exists():
         cfg=json.loads(args.manual_channel_weights_json.read_text())
         for ch in scales:
             for k,v in cfg.get(ch,{}).items(): scales[ch][k]=float(v)
+    global scales_global_for_lookup
+    scales_global_for_lookup = scales
 
     net=None; out=None
     if args.checkpoint is not None:
@@ -66,12 +97,20 @@ def main():
         net.load_state_dict(ck['model']); net.eval()
 
     if args.manual_labels:
-        labs=[x.strip() for x in args.manual_labels.split(',') if x.strip()]
+        requested_labs=[x.strip() for x in args.manual_labels.split(',') if x.strip()]
+        labs=[]
+        for lab in requested_labs:
+            if lab in classes and all(lab in protos[ch] for ch in ['expr','head','jaw']):
+                labs.append(lab)
+            else:
+                print(f"[WARN] unknown manual label ignored: {lab}")
+        print('manual_labels:', requested_labs)
+        print('active_labels:', labs)
         s=np.zeros((1,len(classes)),np.float32)
         for i,c in enumerate(classes):
             if c in labs: s[0,i]=1.0
         scores=torch.from_numpy(s).to(dev)
-        z_proto=compose(scores,classes,protos,scales,dev)
+        z_proto=compose(scores,classes,protos,scales,dev,debug_labels=labs)
         if args.generation_mode=='hybrid' and args.use_residual_with_manual_labels and net is not None:
             enc=SentenceTransformer(args.encoder_name,device=args.device)
             emb=np.asarray(enc.encode([args.prompt],convert_to_numpy=True,normalize_embeddings=False),dtype=np.float32)
