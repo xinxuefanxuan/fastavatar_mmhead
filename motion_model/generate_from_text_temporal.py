@@ -157,15 +157,47 @@ def target_index(motion: np.ndarray, labels: list[str]) -> tuple[int, str]:
     return 0, "neutral"
 
 
-def envelope(ramp: int, hold: int, release: int, release_ratio: float) -> np.ndarray:
+def transition_weights(num_frames: int, mode: str) -> np.ndarray:
+    if num_frames <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    t = np.linspace(0.0, 1.0, num_frames, endpoint=True, dtype=np.float32)
+    if mode == "smoothstep":
+        return t * t * (3.0 - 2.0 * t)
+    return t
+
+
+def build_transition_segment(
+    prev_target: np.ndarray,
+    current_target: np.ndarray,
+    ramp_frames: int,
+    hold_frames: int,
+    release_frames: int,
+    release_ratio: float,
+    transition_mode: str,
+    apply_release: bool,
+) -> np.ndarray:
     parts: list[np.ndarray] = []
-    if ramp > 0:
-        parts.append(np.linspace(0.0, 1.0, ramp, endpoint=True, dtype=np.float32))
-    if hold > 0:
-        parts.append(np.ones((hold,), dtype=np.float32))
-    if release > 0:
-        parts.append(np.linspace(1.0, release_ratio, release, endpoint=True, dtype=np.float32))
-    return np.concatenate(parts, axis=0) if parts else np.ones((1,), dtype=np.float32)
+    if ramp_frames > 0:
+        w = transition_weights(ramp_frames, transition_mode)
+        ramp = (1.0 - w[:, None]) * prev_target[None, :] + w[:, None] * current_target[None, :]
+        parts.append(ramp.astype(np.float32))
+    else:
+        parts.append(current_target[None, :].astype(np.float32))
+
+    if hold_frames > 0:
+        parts.append(np.repeat(current_target[None, :], hold_frames, axis=0).astype(np.float32))
+
+    if apply_release and release_frames > 0:
+        release_target = release_ratio * current_target
+        w = transition_weights(release_frames, transition_mode)
+        release = (1.0 - w[:, None]) * current_target[None, :] + w[:, None] * release_target[None, :]
+        parts.append(release.astype(np.float32))
+
+    return np.concatenate(parts, axis=0) if parts else current_target[None, :].astype(np.float32)
+
+
+def frame_stats(frame: np.ndarray) -> dict:
+    return motion_stats(frame[None, :])
 
 
 def fit_output_len(m: np.ndarray, output_len: int) -> np.ndarray:
@@ -197,6 +229,8 @@ def main() -> None:
     ap.add_argument("--slow_ramp_frames", type=int, default=12)
     ap.add_argument("--quick_ramp_frames", type=int, default=3)
     ap.add_argument("--release_ratio", type=float, default=0.8)
+    ap.add_argument("--release_each_segment", action="store_true")
+    ap.add_argument("--transition_mode", choices=["linear", "smoothstep"], default="smoothstep")
     ap.add_argument("--motion_key", default="motion")
     args = ap.parse_args()
 
@@ -215,7 +249,11 @@ def main() -> None:
     plan_segments: list[dict] = []
     print("prompt:", args.prompt)
     print("carry_mode:", args.carry_mode)
+    print("transition_mode:", args.transition_mode)
+    print("release_each_segment:", args.release_each_segment)
     print("parsed segments:", json.dumps(segments, ensure_ascii=False, indent=2))
+
+    prev_target_raw = np.zeros((56,), dtype=np.float32)
 
     for si, seg in enumerate(segments):
         z = compose_latents(seg["labels"], seg["intensity"], protos, device)
@@ -226,16 +264,50 @@ def main() -> None:
         motion_norm_full = np.concatenate([expr, head, jaw], axis=1)
         motion_raw_full = motion_norm_full * std[None, :] + mean[None, :]
         idx, reason = target_index(motion_raw_full, seg["labels"])
-        target_raw = motion_raw_full[idx]
-        target_norm = motion_norm_full[idx]
-        env = envelope(seg["ramp_frames"], seg["hold_frames"], seg["release_frames"], args.release_ratio)
-        seg_raw = env[:, None] * target_raw[None, :]
-        seg_norm = env[:, None] * target_norm[None, :]
+        target_raw = motion_raw_full[idx].astype(np.float32)
+        if args.carry_mode == "accumulate":
+            transition_start = prev_target_raw
+        else:
+            transition_start = np.zeros((56,), dtype=np.float32)
+        apply_release = bool(args.release_each_segment or si == len(segments) - 1)
+        seg_raw = build_transition_segment(
+            transition_start,
+            target_raw,
+            seg["ramp_frames"],
+            seg["hold_frames"],
+            seg["release_frames"],
+            args.release_ratio,
+            args.transition_mode,
+            apply_release,
+        )
         segment_motions.append(seg_raw.astype(np.float32))
         stats = motion_stats(seg_raw)
-        plan_seg = {**seg, "segment_index": si, "target_frame": idx, "target_strategy": reason, "stats": stats, "num_frames": int(seg_raw.shape[0])}
+        prev_stats = frame_stats(transition_start)
+        current_stats = frame_stats(target_raw)
+        first_stats = frame_stats(seg_raw[0])
+        mid_stats = frame_stats(seg_raw[len(seg_raw) // 2])
+        last_stats = frame_stats(seg_raw[-1])
+        plan_seg = {
+            **seg,
+            "segment_index": si,
+            "target_frame": idx,
+            "target_strategy": reason,
+            "apply_release": apply_release,
+            "prev_target_stats": prev_stats,
+            "current_target_stats": current_stats,
+            "first_frame_stats": first_stats,
+            "mid_frame_stats": mid_stats,
+            "last_frame_stats": last_stats,
+            "stats": stats,
+            "num_frames": int(seg_raw.shape[0]),
+        }
         plan_segments.append(plan_seg)
-        print(f"segment {si}: labels={seg['labels']} target_frame={idx} strategy={reason} stats={stats}")
+        print(f"segment {si}: labels={seg['labels']} target_frame={idx} strategy={reason} apply_release={apply_release}")
+        print(f"  prev_target stats: {prev_stats}")
+        print(f"  current_target stats: {current_stats}")
+        print(f"  first/mid/last stats: first={first_stats} mid={mid_stats} last={last_stats}")
+        print(f"  segment stats: {stats}")
+        prev_target_raw = seg_raw[-1].astype(np.float32)
 
     out_raw = np.concatenate(segment_motions, axis=0) if segment_motions else np.zeros((1, 56), dtype=np.float32)
     out_raw = fit_output_len(out_raw, args.output_len).astype(np.float32)
