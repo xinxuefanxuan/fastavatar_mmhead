@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,6 +11,26 @@ from FastAvatar.models.utils.cross_attn import SD3JointTransformerBlock
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _token_debug_enabled():
+    return os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1"
+
+
+def _shape_summary(obj):
+    if isinstance(obj, torch.Tensor):
+        return list(obj.shape)
+    if isinstance(obj, dict):
+        return {k: _shape_summary(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_shape_summary(v) for v in obj]
+    return type(obj).__name__
+
+
+def _token_debug(label, **items):
+    if _token_debug_enabled():
+        summary = {k: _shape_summary(v) for k, v in items.items()}
+        print(f"[FASTAVATAR_TOKEN_DEBUG] {label}: {summary}")
 
 
 class FrameAttn(nn.Module):
@@ -244,6 +265,13 @@ class AlternatingCrossAttn(nn.Module):
         """
         B, N_input, N_points, C = x.shape
         B2, N_input2, HW, C2 = cond.shape
+        _token_debug(
+            "AlternatingCrossAttn/input",
+            x=x,
+            cond=cond,
+            compressed_x=compressed_x if compressed_x is not None else "None",
+            compressed_cond=compressed_cond if compressed_cond is not None else "None",
+        )
         assert B == B2 and C == C2 and N_input == N_input2, "Batch, channel and frame dimensions must match"
         
         has_compressed = self.if_framepack and compressed_cond is not None and compressed_x is not None
@@ -252,6 +280,7 @@ class AlternatingCrossAttn(nn.Module):
         # Step 1: Preprocess base frames
         # ============================================================================
         cond = self.frame_attn.linear_cond_proj(cond) if hasattr(self.frame_attn, 'linear_cond_proj') else cond
+        _token_debug("AlternatingCrossAttn/base_context_projected", cond=cond)
 
         frame_indices = torch.arange(N_input, device=cond.device)
         frame_emb = self.frame_idx_emb[frame_indices]  # [N_input, C]
@@ -288,6 +317,7 @@ class AlternatingCrossAttn(nn.Module):
 
             # Reshape compressed_cond to per-frame format first
             compressed_cond = compressed_cond.reshape(B, N_compressed_frames, H_compressed * W_compressed, C)
+            _token_debug("AlternatingCrossAttn/compressed_context_projected", compressed_cond=compressed_cond)
 
             # Generate frame embeddings for compressed frames
             compressed_frame_indices = torch.arange(N_input, N_input + N_compressed_frames, device=compressed_cond.device)
@@ -388,5 +418,6 @@ class AlternatingCrossAttn(nn.Module):
             x = torch.cat([x, compressed_x], dim=1)
 
         x = self.frame_attn.norm(x)
+        _token_debug("AlternatingCrossAttn/output", x=x)
 
         return x
