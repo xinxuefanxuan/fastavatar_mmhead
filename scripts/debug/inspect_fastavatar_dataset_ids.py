@@ -31,8 +31,9 @@ def required_pairs_from_config(cfg: Any) -> tuple[int, int, int]:
     return input_frames + target_frames, input_frames, target_frames
 
 
-def item_required_pairs(frame_data: dict[str, Any], default_input_frames: int, target_frames: int) -> int:
-    return int(frame_data.get("input_frames", default_input_frames)) + int(target_frames)
+def frame_data_input_frames(frame_data: dict[str, Any]) -> int | None:
+    value = frame_data.get("input_frames")
+    return int(value) if value is not None else None
 
 
 def load_meta(meta_path: Path) -> dict[str, Any]:
@@ -168,11 +169,11 @@ def main() -> int:
     cfg_path = resolve_path(args.config, repo_root)
     print(f"[InspectDataset] config={cfg_path}")
     cfg = load_config(cfg_path)
-    inferred_required_pairs, default_input_frames, target_frames = required_pairs_from_config(cfg)
+    config_required_pairs, default_input_frames, target_frames = required_pairs_from_config(cfg)
     if str(args.min_pairs).lower() == "auto":
-        min_pairs = inferred_required_pairs
+        required_pairs = config_required_pairs
     else:
-        min_pairs = int(args.min_pairs)
+        required_pairs = int(args.min_pairs)
 
     meta_path = resolve_path(cfg.dataset.meta_path, repo_root)
     dataset_cfg = cfg.dataset.datasets[args.dataset]
@@ -186,8 +187,8 @@ def main() -> int:
     print(f"[InspectDataset] configured val_id={configured_val_id}")
     print(f"[InspectDataset] input_frames={default_input_frames}")
     print(f"[InspectDataset] target_frames={target_frames}")
-    print(f"[InspectDataset] inferred_required_pairs={inferred_required_pairs}")
-    print(f"[InspectDataset] min_pairs={args.min_pairs} effective_min_pairs={min_pairs}")
+    print(f"[InspectDataset] inferred_required_pairs={config_required_pairs}")
+    print(f"[InspectDataset] min_pairs={args.min_pairs} effective_required_pairs={required_pairs}")
 
     if not meta_path.exists():
         print(f"[InspectDataset][ERROR] metadata does not exist: {meta_path}")
@@ -199,8 +200,8 @@ def main() -> int:
 
     print(f"[InspectDataset] loaded frame groups/items total={len(all_meta)}")
     print(f"[InspectDataset] filtered frame groups/items for {args.dataset}={len(filtered)}")
-    print_pair_stats("all", pair_stats((pair_count(v) for v in filtered.values()), min_pairs), min_pairs)
-    print_pair_stats("train", pair_stats((pair_count(v) for v in counts["train_items"].values()), min_pairs), min_pairs)
+    print_pair_stats("all", pair_stats((pair_count(v) for v in filtered.values()), required_pairs), required_pairs)
+    print_pair_stats("train", pair_stats((pair_count(v) for v in counts["train_items"].values()), required_pairs), required_pairs)
     print(f"[InspectDataset] available IDs ({len(counts['available_ids'])}): {counts['available_ids'][:50]}")
     if len(counts["available_ids"]) > 50:
         print(f"[InspectDataset] ... {len(counts['available_ids']) - 50} more IDs omitted")
@@ -214,13 +215,13 @@ def main() -> int:
     offending = []
     for key, value in counts["train_items"].items():
         raw_count = pair_count(value)
-        required = item_required_pairs(value, default_input_frames, target_frames) if str(args.min_pairs).lower() == "auto" else min_pairs
-        ok = raw_count >= required
+        ok = raw_count >= required_pairs
         uid = extract_nersemble_id(key)
         status = "pass" if ok else "fail"
-        print(f"  - key={key} uid={uid} raw_pair_count={raw_count} effective_pair_count={required} {status}")
+        item_input_frames = frame_data_input_frames(value)
+        print(f"  - key={key} uid={uid} raw_pair_count={raw_count} required_pairs={required_pairs} pass={ok} frame_data_input_frames={item_input_frames} {status}")
         if not ok:
-            offending.append((key, raw_count, required))
+            offending.append((key, raw_count, required_pairs))
     if offending:
         print(f"[InspectDataset][ERROR] Train frame groups below required pair count:")
         for key, count, required in offending[:50]:

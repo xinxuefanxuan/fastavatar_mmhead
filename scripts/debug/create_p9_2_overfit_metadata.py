@@ -43,8 +43,9 @@ def required_pairs_from_config(config_path: Path | None) -> tuple[int, int, int]
     return input_frames + target_frames, input_frames, target_frames
 
 
-def item_required_pairs(frame_data: dict[str, Any], default_input_frames: int, target_frames: int) -> int:
-    return int(frame_data.get("input_frames", default_input_frames)) + int(target_frames)
+def frame_data_input_frames(frame_data: dict[str, Any]) -> int | None:
+    value = frame_data.get("input_frames")
+    return int(value) if value is not None else None
 
 
 def filter_nersemble(all_frame_groups: dict[str, Any]) -> dict[str, Any]:
@@ -158,20 +159,17 @@ def main() -> None:
         args.max_ids = args.num_ids
 
     config_path = resolve_path(args.config, Path.cwd()) if args.config else None
+    config_required_pairs, default_input_frames, target_frames = required_pairs_from_config(config_path)
     if str(args.min_pairs).lower() == "auto":
-        inferred_required_pairs, default_input_frames, target_frames = required_pairs_from_config(config_path)
+        required_pairs = config_required_pairs
     else:
-        inferred_required_pairs = int(args.min_pairs)
-        if config_path and config_path.exists():
-            _, default_input_frames, target_frames = required_pairs_from_config(config_path)
-        else:
-            default_input_frames = max(inferred_required_pairs, 0)
-            target_frames = 0
+        required_pairs = int(args.min_pairs)
 
     print(f"[CreateP9.2Meta] config={config_path}")
     print(f"[CreateP9.2Meta] input_frames={default_input_frames}")
     print(f"[CreateP9.2Meta] target_frames={target_frames}")
-    print(f"[CreateP9.2Meta] inferred_required_pairs={inferred_required_pairs}")
+    print(f"[CreateP9.2Meta] inferred_required_pairs={config_required_pairs}")
+    print(f"[CreateP9.2Meta] effective_required_pairs={required_pairs}")
 
     if not args.source_meta.exists():
         raise FileNotFoundError(f"source metadata not found: {args.source_meta}")
@@ -180,13 +178,13 @@ def main() -> None:
 
     all_meta = load_json(args.source_meta)
     filtered = filter_nersemble(all_meta)
-    print_pair_distribution("pair-count distribution before filtering", [pair_count(v) for v in filtered.values()], inferred_required_pairs)
+    print_pair_distribution("pair-count distribution before filtering", [pair_count(v) for v in filtered.values()], required_pairs)
 
     by_id: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
     skipped_short = 0
     skipped_missing = 0
+    max_available_pairs = max((pair_count(frame_data) for frame_data in filtered.values()), default=0)
     for clean_key, frame_data in filtered.items():
-        required_pairs = item_required_pairs(frame_data, default_input_frames, target_frames)
         if pair_count(frame_data) < required_pairs:
             skipped_short += 1
             continue
@@ -198,9 +196,10 @@ def main() -> None:
     eligible_count = sum(len(items) for items in by_id.values())
     if eligible_count == 0:
         raise RuntimeError(
-            "No eligible frame groups satisfy min_pairs and file validation. "
-            f"required_pairs={inferred_required_pairs}, skipped_short={skipped_short}, skipped_missing={skipped_missing}. "
-            "Try lowering input_frames/target_frames in the config or overriding --min_pairs."
+            f"No frame groups satisfy required_pairs={required_pairs}. "
+            f"Max available pairs={max_available_pairs}. "
+            f"skipped_short={skipped_short}, skipped_missing={skipped_missing}. "
+            "Reduce dataset.input_frames/target_frames or use a different dataset."
         )
 
     preferred = parse_prefer_ids(args.prefer_ids)
@@ -211,13 +210,13 @@ def main() -> None:
     selected_ids = sorted(ordered_ids[: min(args.max_ids, len(ordered_ids))])
 
     out: dict[str, Any] = {}
-    selected_groups: list[tuple[str, int, int]] = []
+    selected_groups: list[tuple[str, str, int, int, int | None]] = []
     for uid in selected_ids:
         items = list(by_id[uid])
         rng.shuffle(items)
         for clean_key, frame_data in items[: args.max_items_per_id]:
             out[prefixed_key(clean_key)] = frame_data
-            selected_groups.append((prefixed_key(clean_key), pair_count(frame_data), item_required_pairs(frame_data, default_input_frames, target_frames)))
+            selected_groups.append((prefixed_key(clean_key), extract_id(clean_key), pair_count(frame_data), required_pairs, frame_data_input_frames(frame_data)))
 
     if not out:
         raise RuntimeError(
@@ -231,7 +230,7 @@ def main() -> None:
     print(f"[CreateP9.2Meta] root_dir={args.root_dir}")
     print(f"[CreateP9.2Meta] output={args.output}")
     print(f"[CreateP9.2Meta] min_pairs={args.min_pairs}")
-    print(f"[CreateP9.2Meta] effective_required_pairs={inferred_required_pairs}")
+    print(f"[CreateP9.2Meta] effective_required_pairs={required_pairs}")
     print(f"[CreateP9.2Meta] skipped_short={skipped_short}")
     print(f"[CreateP9.2Meta] skipped_missing_or_invalid={skipped_missing}")
     print(f"[CreateP9.2Meta] eligible frame groups={eligible_count}")
@@ -239,8 +238,8 @@ def main() -> None:
     print(f"[CreateP9.2Meta] item count={len(out)}")
     print(f"[CreateP9.2Meta] per-ID counts={dict(Counter(extract_id(k[len('nersemble/'):]) for k in out))}")
     print("[CreateP9.2Meta] selected frame groups with pair counts:")
-    for key, count, required in selected_groups:
-        print(f"  - {key}: pairs={count} required={required}")
+    for key, uid, count, required, item_input_frames in selected_groups:
+        print(f"  - key={key} uid={uid} pairs={count} required_pairs={required} pass={count >= required} frame_data_input_frames={item_input_frames}")
     print("[CreateP9.2Meta] No processed data was copied; metadata references the existing root_dir.")
 
 
