@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import torch
 import torch.nn as nn
@@ -9,12 +10,34 @@ from safetensors.torch import load_file
 from FastAvatar.models.rendering.gs_renderer import GS3DRenderer, PointEmbed
 from FastAvatar.models.alternating_cross_attn import AlternatingCrossAttn
 from FastAvatar.models.framepack_utils import FramePackCompressor
+from FastAvatar.models.motion_token_adapter import MotionTokenAdapter
 from FastAvatar.models.encoders.dinov2_fusion_wrapper import Dinov2FusionWrapper
 from diffusers.utils import is_torch_version
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _token_debug_enabled():
+    return os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1"
+
+
+def _shape_summary(obj):
+    if isinstance(obj, torch.Tensor):
+        return list(obj.shape)
+    if isinstance(obj, dict):
+        return {k: _shape_summary(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_shape_summary(v) for v in obj]
+    return type(obj).__name__
+
+
+def _token_debug(label, **items):
+    if _token_debug_enabled():
+        summary = {k: _shape_summary(v) for k, v in items.items()}
+        print(f"[FASTAVATAR_TOKEN_DEBUG] {label}: {summary}")
+
 
 class ModelFastAvatar(nn.Module):
     def __init__(self,
@@ -47,6 +70,18 @@ class ModelFastAvatar(nn.Module):
                  if_framepack: bool = False,
                  framepack_compression_level: int = 4,
                  vggt_path: str = None,
+                 use_motion_token: bool = False,
+                 motion_token_input_dim: int = 96,
+                 motion_token_hidden_dim: int = None,
+                 motion_token_mode: str = "add_query",
+                 motion_token_scale: float = 1.0,
+                 zero_flame_motion: bool = False,
+                 freeze_backbone_for_motion_token: bool = False,
+                 motion_token_source: str = "none",
+                 motion_token_norm_stats: str = None,
+                 motion_token_expr_dim: int = 50,
+                 motion_token_pad_to_dim: int = 96,
+                 motion_token_train_adapter_only_strict: bool = False,
                  **kwargs,
                  ):
         super().__init__()
@@ -61,6 +96,29 @@ class ModelFastAvatar(nn.Module):
         self.if_framepack = if_framepack
         self.framepack_compression_level = framepack_compression_level
         self.source_image_res = source_image_res
+        self.use_motion_token = bool(use_motion_token)
+        self.motion_token_input_dim = int(motion_token_input_dim)
+        self.motion_token_hidden_dim = int(motion_token_hidden_dim or transformer_dim)
+        self.motion_token_mode = motion_token_mode
+        self.motion_token_scale = float(motion_token_scale)
+        self.zero_flame_motion = bool(zero_flame_motion)
+        self.freeze_backbone_for_motion_token = bool(freeze_backbone_for_motion_token)
+        self.motion_token_source = motion_token_source
+        self.motion_token_norm_stats = motion_token_norm_stats
+        self.motion_token_expr_dim = int(motion_token_expr_dim)
+        self.motion_token_pad_to_dim = int(motion_token_pad_to_dim)
+        self.motion_token_train_adapter_only_strict = bool(motion_token_train_adapter_only_strict)
+        self.motion_token_norm_mean = None
+        self.motion_token_norm_std = None
+        if self.motion_token_norm_stats:
+            with open(self.motion_token_norm_stats, "r") as f:
+                norm_stats = json.load(f)
+            self.motion_token_norm_mean = torch.tensor(norm_stats["mean"][:56], dtype=torch.float32)
+            self.motion_token_norm_std = torch.tensor(norm_stats["std"][:56], dtype=torch.float32)
+        if self.motion_token_source not in ("none", "frame_flame_gt", "zeros", "external"):
+            raise ValueError(f"Unsupported motion_token_source={self.motion_token_source}")
+        if self.motion_token_mode != "add_query":
+            raise ValueError(f"P9.1 only supports motion_token_mode='add_query', got {self.motion_token_mode}")
 
         # FramePack compressor (only used when if_framepack=True)
         if if_framepack:
@@ -81,6 +139,15 @@ class ModelFastAvatar(nn.Module):
 
         # learnable points embedding
         self.pcl_embed = PointEmbed(dim=pcl_dim)
+
+        # Optional P9.1 motion token adapter. Disabled by default to preserve exact behavior.
+        self.motion_token_adapter = None
+        if self.use_motion_token:
+            self.motion_token_adapter = MotionTokenAdapter(
+                input_dim=self.motion_token_input_dim,
+                hidden_dim=self.motion_token_hidden_dim,
+                output_dim=transformer_dim,
+            )
 
         # Alternating cross Attention
         self.transformer = AlternatingCrossAttn(
@@ -144,7 +211,144 @@ class ModelFastAvatar(nn.Module):
                 param.requires_grad = not renderer_freeze
             else:
                 param.requires_grad = False
+        if self.freeze_backbone_for_motion_token:
+            self.freeze_backbone_keep_motion_token_trainable()
         
+
+    def freeze_backbone_keep_motion_token_trainable(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        if self.motion_token_adapter is None:
+            raise RuntimeError("freeze_backbone_for_motion_token=True requires use_motion_token=True and a MotionTokenAdapter")
+        for param in self.motion_token_adapter.parameters():
+            param.requires_grad = True
+        trainable = [(name, p.numel()) for name, p in self.named_parameters() if p.requires_grad]
+        total = sum(n for _, n in trainable)
+        print(f"[MotionTokenAdapter] freeze_backbone_for_motion_token=True; trainable parameter count={total}")
+        for name, count in trainable:
+            print(f"[MotionTokenAdapter] trainable: {name} ({count})")
+        adapter_trainable = [name for name, _ in trainable if name.startswith("motion_token_adapter.")]
+        if not adapter_trainable:
+            raise RuntimeError("MotionTokenAdapter has no trainable parameters after freezing the backbone")
+        if self.motion_token_train_adapter_only_strict:
+            non_adapter = [name for name, _ in trainable if not name.startswith("motion_token_adapter.")]
+            if non_adapter:
+                raise RuntimeError(
+                    "motion_token_train_adapter_only_strict=True but non-adapter parameters remain trainable: "
+                    + ", ".join(non_adapter[:20])
+                )
+
+    def _prepare_motion_token_input(self, motion_token_input, batch_size: int, device, dtype):
+        if not self.use_motion_token:
+            return None
+        if motion_token_input is None:
+            if _token_debug_enabled():
+                print(
+                    f"[FASTAVATAR_TOKEN_DEBUG] use_motion_token=True but motion_token_input is missing; "
+                    f"using zeros [B,{self.motion_token_input_dim}]"
+                )
+            motion_token_input = torch.zeros(batch_size, self.motion_token_input_dim, device=device, dtype=dtype)
+        else:
+            motion_token_input = motion_token_input.to(device=device, dtype=dtype)
+        return motion_token_input
+
+    def _condition_query_tokens(self, query_tokens, motion_token_input):
+        if _token_debug_enabled():
+            _token_debug(
+                "motion_token/config",
+                use_motion_token=self.use_motion_token,
+                zero_flame_motion=self.zero_flame_motion,
+                motion_token_scale=self.motion_token_scale,
+            )
+        if not self.use_motion_token:
+            return query_tokens
+        motion_token_input = self._prepare_motion_token_input(
+            motion_token_input, query_tokens.shape[0], query_tokens.device, query_tokens.dtype
+        )
+        projected_motion_token = self.motion_token_adapter(motion_token_input)
+        _token_debug(
+            "motion_token/add_query",
+            motion_token_input=motion_token_input,
+            projected_motion_token=projected_motion_token,
+            query_tokens_before=query_tokens,
+            motion_token_scale=self.motion_token_scale,
+        )
+        query_tokens = query_tokens + self.motion_token_scale * projected_motion_token[:, None, None, :]
+        _token_debug("motion_token/query_tokens_after", query_tokens=query_tokens)
+        return query_tokens
+
+    def _clone_and_zero_flame_motion(self, flame_params):
+        if not self.zero_flame_motion:
+            return flame_params
+        zero_fields = ["expr", "jaw_pose", "neck_pose", "rotation"]
+        # Keep shape/betas, camera, and translation unchanged. Translation can encode camera/framing alignment
+        # in this codebase, so P9.1 does not treat it as removable motion conditioning.
+        out = {}
+        zeroed = []
+        for key, value in flame_params.items():
+            if key in zero_fields and isinstance(value, torch.Tensor):
+                out[key] = torch.zeros_like(value)
+                zeroed.append(key)
+            else:
+                out[key] = value
+        if _token_debug_enabled():
+            print(f"[FASTAVATAR_TOKEN_DEBUG] zero_flame_motion=True; zeroed_fields={zeroed}")
+        return out
+
+    def _frame_average(self, value: torch.Tensor) -> torch.Tensor:
+        if value.ndim == 3:
+            return value.mean(dim=1)
+        if value.ndim == 2:
+            return value
+        raise ValueError(f"Expected FLAME tensor [B,N,D] or [B,D], got {list(value.shape)}")
+
+    def _pad_or_truncate_last_dim(self, value: torch.Tensor, target_dim: int) -> torch.Tensor:
+        if value.shape[-1] > target_dim:
+            return value[..., :target_dim]
+        if value.shape[-1] < target_dim:
+            pad = torch.zeros(*value.shape[:-1], target_dim - value.shape[-1], device=value.device, dtype=value.dtype)
+            return torch.cat([value, pad], dim=-1)
+        return value
+
+    def build_motion_token_input_from_flame(self, flame_params) -> torch.Tensor:
+        required = ["expr", "neck_pose", "jaw_pose"]
+        missing = [key for key in required if key not in flame_params or not isinstance(flame_params[key], torch.Tensor)]
+        if missing:
+            raise ValueError(f"motion_token_source='frame_flame_gt' requires FLAME tensor fields {required}; missing {missing}")
+
+        expr = self._frame_average(flame_params["expr"])
+        expr = self._pad_or_truncate_last_dim(expr[..., : self.motion_token_expr_dim], 50)
+        neck = self._pad_or_truncate_last_dim(self._frame_average(flame_params["neck_pose"]), 3)
+        jaw = self._pad_or_truncate_last_dim(self._frame_average(flame_params["jaw_pose"]), 3)
+        motion56 = torch.cat([expr, neck, jaw], dim=-1)
+
+        if self.motion_token_norm_mean is not None and self.motion_token_norm_std is not None:
+            mean = self.motion_token_norm_mean.to(device=motion56.device, dtype=motion56.dtype)
+            std = self.motion_token_norm_std.to(device=motion56.device, dtype=motion56.dtype).clamp_min(1e-8)
+            motion56 = (motion56 - mean[None, :]) / std[None, :]
+
+        token = self._pad_or_truncate_last_dim(motion56, self.motion_token_pad_to_dim)
+        _token_debug("motion_token/frame_flame_gt", motion56=motion56, motion_token_input=token)
+        return token
+
+    def _resolve_motion_token_input(self, motion_token_input, flame_params):
+        if not self.use_motion_token:
+            return motion_token_input
+        if motion_token_input is not None:
+            return motion_token_input
+        if self.motion_token_source == "none":
+            return None
+        if self.motion_token_source == "zeros":
+            expr = flame_params.get("expr") if isinstance(flame_params, dict) else None
+            if not isinstance(expr, torch.Tensor):
+                raise ValueError("motion_token_source='zeros' requires flame_params['expr'] to infer batch/device")
+            base = self._frame_average(expr)
+            return torch.zeros(base.shape[0], self.motion_token_pad_to_dim, device=base.device, dtype=base.dtype)
+        if self.motion_token_source == "frame_flame_gt":
+            return self.build_motion_token_input_from_flame(flame_params)
+        if self.motion_token_source == "external":
+            raise ValueError("motion_token_source='external' requires an explicit motion_token_input tensor")
+        raise ValueError(f"Unsupported motion_token_source={self.motion_token_source}")
 
     def forward_encode_image(self, image):
         """
@@ -158,6 +362,7 @@ class ModelFastAvatar(nn.Module):
             spatial_compression: int or None - Spatial compression ratio used (if framepack enabled)
         """
         B, N_frames, C_img, H_img, W_img = image.shape
+        _token_debug("forward_encode_image/input", image=image)
         image = image.view(B * N_frames, C_img, H_img, W_img)
 
         tgt_size = (self.source_image_res // 14) * 14
@@ -201,16 +406,23 @@ class ModelFastAvatar(nn.Module):
             compressed_features, spatial_compression = self.framepack_compressor(compressed_input_3d)
 
             compressed_cond = compressed_features.reshape(B, 1, -1, C)
+            _token_debug(
+                "forward_encode_image/framepack_output",
+                base_image_feats=base_image_feats,
+                compressed_cond=compressed_cond,
+                spatial_compression=torch.tensor(spatial_compression),
+            )
 
             return base_image_feats, compressed_cond, base_indices, spatial_compression
         else:
             # No FramePack: simply slice all inputs to num_base_frames
             image_feats = image_feats.view(B, N_frames, HW, C)
             image_feats = image_feats[:, :self.num_base_frames]
+            _token_debug("forward_encode_image/output", image_feats=image_feats)
 
             return image_feats, None, None, None
 
-    def forward_transformer(self, image_feats, query_points, query_feats=None, compressed_cond=None, spatial_compression=None):
+    def forward_transformer(self, image_feats, query_points, query_feats=None, compressed_cond=None, spatial_compression=None, motion_token_input=None):
         """
         Args:
             image_feats: [B, N_input, H*W, C]
@@ -222,33 +434,52 @@ class ModelFastAvatar(nn.Module):
             latent_points: [B, N_input, N_points, C]
         """
         B, N_input = image_feats.shape[:2]
+        _token_debug(
+            "forward_transformer/input",
+            image_feats=image_feats,
+            query_points=query_points,
+            query_feats=query_feats if query_feats is not None else "None",
+            compressed_cond=compressed_cond if compressed_cond is not None else "None",
+        )
 
         # Reshape query_points for pcl_embed
         x = self.pcl_embed(query_points.reshape(B, -1, 3))
         x = x.reshape(B, query_points.shape[1], query_points.shape[2], x.shape[-1])
         if query_feats is not None:
             x = x + query_feats.to(image_feats.dtype)
+        x = self._condition_query_tokens(x, motion_token_input)
 
         # Prepare compressed frame query points if exists
         compressed_x = x[:, N_input:N_input+1] if compressed_cond is not None else None
         if compressed_x is not None:
             x = x[:, :N_input]
 
-        return self.transformer(x, image_feats, compressed_x=compressed_x, compressed_cond=compressed_cond, spatial_compression=spatial_compression)
+        _token_debug(
+            "forward_transformer/tokens",
+            point_tokens=x,
+            compressed_point_tokens=compressed_x if compressed_x is not None else "None",
+            context_tokens=image_feats,
+            compressed_context=compressed_cond if compressed_cond is not None else "None",
+        )
+        latent_points = self.transformer(x, image_feats, compressed_x=compressed_x, compressed_cond=compressed_cond, spatial_compression=spatial_compression)
+        _token_debug("forward_transformer/output", latent_points=latent_points)
+        return latent_points
 
     @torch.compile
-    def forward_latent_points(self, image, input_flame_params):
+    def forward_latent_points(self, image, input_flame_params, motion_token_input=None):
 
         B, N_input = image.shape[:2]
+        _token_debug("forward_latent_points/input", image=image, input_flame_params=input_flame_params)
         base_frames = min(self.num_base_frames, N_input)
 
         # Encode ALL frames + FramePack (compress non-base frames when if_framepack=True)
         base_feats, compressed_cond, _, spatial_compression = self.forward_encode_image(image)
 
-        flame_for_query = input_flame_params.copy()
+        flame_for_query = self._clone_and_zero_flame_motion(input_flame_params.copy())
         if 'betas' not in flame_for_query and 'shape' in flame_for_query:
             flame_for_query['betas'] = flame_for_query['shape']
         query_points, _ = self.renderer.get_query_points(flame_for_query, device=image.device)
+        _token_debug("forward_latent_points/query_points", query_points=query_points)
 
         # Prepare query points for transformer (base_frames + 1 compressed if exists)
         query_points_transformer = query_points[:, 0:1].repeat(1, base_frames, 1, 1)
@@ -260,9 +491,11 @@ class ModelFastAvatar(nn.Module):
             base_feats,
             query_points_transformer,
             compressed_cond=compressed_cond,
-            spatial_compression=spatial_compression
+            spatial_compression=spatial_compression,
+            motion_token_input=motion_token_input
         )
         
+        _token_debug("forward_latent_points/output", latent_points=latent_points, query_points_transformer=query_points_transformer)
         return latent_points, query_points_transformer
 
     def _render_multiple_frames(self, latent_points, query_points, inf_flame_params, c2ws, intrs, bg_colors, render_h, render_w, N_inf, chunk_size=16, input_indices=[0]):
@@ -290,6 +523,15 @@ class ModelFastAvatar(nn.Module):
         Returns:
             Dict containing concatenated render results for all frames
         """
+        _token_debug(
+            "render_multiple_frames/input",
+            latent_points=latent_points,
+            query_points=query_points,
+            inf_flame_params=render_flame_params,
+            c2ws=c2ws,
+            intrs=intrs,
+            bg_colors=bg_colors,
+        )
         # Calculate number of chunks
         if chunk_size >= N_inf:
             # Render all frames at once
@@ -373,21 +615,34 @@ class ModelFastAvatar(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            _token_debug("render_multiple_frames/output", **out)
             return out
         finally:
             # Additional cleanup if needed (render_res_list already cleaned in the loop)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def forward(self, input_image, target_image, input_c2ws, target_c2ws, input_intrs, target_intrs, input_bg_colors, target_bg_colors, landmarks, input_flame_params, inf_flame_params, uid):
+    def forward(self, input_image, target_image, input_c2ws, target_c2ws, input_intrs, target_intrs, input_bg_colors, target_bg_colors, landmarks, input_flame_params, inf_flame_params, uid, motion_token_input=None):
         B, N_input = input_image.shape[:2]
         N_target = target_image.shape[1]
+        _token_debug(
+            "forward/input",
+            input_image=input_image,
+            target_image=target_image,
+            input_flame_params=input_flame_params,
+            inf_flame_params=inf_flame_params,
+            motion_token_input=motion_token_input if motion_token_input is not None else "None",
+        )
         
         # Obtain rendering resolution from target image to guarantee match for losses
         render_h, render_w = target_image.shape[-2:]
         
+        # Build token from original target FLAME before any explicit motion zeroing.
+        motion_token_input = self._resolve_motion_token_input(motion_token_input, inf_flame_params)
+        render_flame_params = self._clone_and_zero_flame_motion(inf_flame_params)
+
         # Forward: encoder + transformer, using GT FLAME params for query points
-        latent_points, query_points = self.forward_latent_points(input_image, input_flame_params)
+        latent_points, query_points = self.forward_latent_points(input_image, input_flame_params, motion_token_input=motion_token_input)
         
         del input_image, target_image
         if torch.cuda.is_available():
@@ -417,7 +672,7 @@ class ModelFastAvatar(nn.Module):
         out = self._render_multiple_frames(
             latent_points=latent_flat,
             query_points=query_flat,
-            inf_flame_params=inf_flame_params,
+            inf_flame_params=render_flame_params,
             c2ws=target_c2ws,
             intrs=target_intrs_scaled,
             bg_colors=target_bg_colors,
@@ -428,16 +683,28 @@ class ModelFastAvatar(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
+        _token_debug("forward/output", **out)
         return out
     
     @torch.no_grad()
-    def infer_images(self, image, input_c2ws, input_intrs, target_c2ws, target_intrs, target_bg_colors, input_flame_params, inf_flame_params=None, render_h=512, render_w=512):
+    def infer_images(self, image, input_c2ws, input_intrs, target_c2ws, target_intrs, target_bg_colors, input_flame_params, inf_flame_params=None, render_h=512, render_w=512, motion_token_input=None):
         B, N_input = image.shape[:2]
         N_target = target_c2ws.shape[1]
+        _token_debug(
+            "infer_images/input",
+            image=image,
+            input_flame_params=input_flame_params,
+            inf_flame_params=inf_flame_params if inf_flame_params is not None else "None",
+            target_c2ws=target_c2ws,
+            target_intrs=target_intrs,
+            motion_token_input=motion_token_input if motion_token_input is not None else "None",
+        )
         
         modeling_time = time.time()
         
-        latent_points, query_points = self.forward_latent_points(image, input_flame_params)
+        motion_token_input = self._resolve_motion_token_input(motion_token_input, inf_flame_params)
+        render_flame_params = self._clone_and_zero_flame_motion(inf_flame_params)
+        latent_points, query_points = self.forward_latent_points(image, input_flame_params, motion_token_input=motion_token_input)
 
         # Clean up input tensors immediately after forward_latent_points
         del image, input_c2ws, input_intrs
@@ -459,7 +726,7 @@ class ModelFastAvatar(nn.Module):
         out = self._render_multiple_frames(
             latent_points=latent_points_reshaped,
             query_points=query_points_reshaped,
-            inf_flame_params=inf_flame_params,
+            inf_flame_params=render_flame_params,
             c2ws=target_c2ws,
             intrs=target_intrs,
             bg_colors=target_bg_colors,
@@ -484,4 +751,5 @@ class ModelFastAvatar(nn.Module):
             if len(out["comp_rgb"].shape) == 5:
                 out["comp_rgb"] = out["comp_rgb"][0].permute(0, 2, 3, 1)
         
+        _token_debug("infer_images/output", **out)
         return out
