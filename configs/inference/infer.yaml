@@ -60,6 +60,10 @@ model:
     motion_token_scale: 1.0
     zero_flame_motion: false
     freeze_backbone_for_motion_token: false
+    motion_token_source: "none"
+    motion_token_norm_stats: null
+    motion_token_expr_dim: 50
+    motion_token_pad_to_dim: 96
 
 dataset:
     input_frames: 256
