@@ -70,20 +70,20 @@ dataset:
     target_frames: 16
     render_image_res: 512
     source_image_res: 512
-    num_train_workers: 0
-    num_val_workers: 0
+    num_train_workers: 1
+    num_val_workers: 1
     pin_mem: true
-    val_num: 1
+    val_num: 2
     multiply: 2
     # Multiple datasets config
-    meta_path: "./datasets/mixed_uids.json"
+    meta_path: "./datasets/p9_2_overfit_mixed_uids.json"
     datasets:
         nersemble:
-            root_dir: YOUR_DATA_PATH
+            root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
             task_type: "unified"
-            val_id: ['089','090'] # '309', '146', '123', '370', '204'
+            val_id: [] # P9.2: use fixed random valid IDs from project-local overfit metadata; run inspect_fastavatar_dataset_ids.py to choose explicit IDs if desired
         # vfhq:
-        #     root_dir: YOUR_DATA_PATH
+        #     root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
         #     task_type: "monocular"
         #     val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
 
