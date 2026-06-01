@@ -44,6 +44,8 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
         except Exception as e:
             traceback.print_exc()
             print(f"[DEBUG-DATASET] Error when loading {self.uids[idx]}")
+            if os.environ.get("FASTAVATAR_DATASET_FAIL_FAST") == "1":
+                raise e
             # raise e
             return self.__getitem__((idx + 1) % self.__len__())
 
@@ -120,6 +122,8 @@ class FrameBaseDataset(torch.utils.data.Dataset, ABC):
         except Exception as e:
             traceback.print_exc()
             print(f"[DEBUG-DATASET] Error when loading {self.uids[idx]}")
+            if os.environ.get("FASTAVATAR_DATASET_FAIL_FAST") == "1":
+                raise e
             # raise e
             return self.__getitem__((idx + 1) % self.__len__())
     

@@ -132,13 +132,16 @@ class FastAvatarTrainer(Trainer):
             use_teeth=getattr(cfg.model, 'add_teeth', True)
         )
 
+        num_train_workers = int(cfg.dataset.num_train_workers)
+        num_val_workers = int(cfg.dataset.num_val_workers)
+
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=cfg.train.batch_size,
             shuffle=True,
-            num_workers=cfg.dataset.num_train_workers,
+            num_workers=num_train_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_train_workers > 0),
             drop_last=True
         )
 
@@ -146,9 +149,9 @@ class FastAvatarTrainer(Trainer):
             val_dataset,
             batch_size=cfg.val.batch_size,
             shuffle=False,
-            num_workers=cfg.dataset.num_val_workers,
+            num_workers=num_val_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_val_workers > 0),
             drop_last=False
         )
 
