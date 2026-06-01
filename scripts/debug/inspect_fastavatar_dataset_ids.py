@@ -25,6 +25,16 @@ def resolve_path(value: str | Path, base: Path) -> Path:
     return (base / p).resolve()
 
 
+def required_pairs_from_config(cfg: Any) -> tuple[int, int, int]:
+    input_frames = int(cfg.dataset.input_frames)
+    target_frames = int(cfg.dataset.target_frames)
+    return input_frames + target_frames, input_frames, target_frames
+
+
+def item_required_pairs(frame_data: dict[str, Any], default_input_frames: int, target_frames: int) -> int:
+    return int(frame_data.get("input_frames", default_input_frames)) + int(target_frames)
+
+
 def load_meta(meta_path: Path) -> dict[str, Any]:
     with meta_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -150,7 +160,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect FastAvatar dataset IDs and train/val split for a config.")
     parser.add_argument("--config", type=Path, default=Path("configs/train/fastavatar_motion_zero_token_overfit.yaml"))
     parser.add_argument("--dataset", default="nersemble")
-    parser.add_argument("--min_pairs", type=int, default=27)
+    parser.add_argument("--min_pairs", default="auto", help="Required camera-frame pairs, or auto to infer input_frames + target_frames from config.")
     parser.add_argument("--require_train", action="store_true", help="Exit non-zero if expected train count is zero, metadata is missing, or train frame groups are too short.")
     args = parser.parse_args()
 
@@ -158,6 +168,11 @@ def main() -> int:
     cfg_path = resolve_path(args.config, repo_root)
     print(f"[InspectDataset] config={cfg_path}")
     cfg = load_config(cfg_path)
+    inferred_required_pairs, default_input_frames, target_frames = required_pairs_from_config(cfg)
+    if str(args.min_pairs).lower() == "auto":
+        min_pairs = inferred_required_pairs
+    else:
+        min_pairs = int(args.min_pairs)
 
     meta_path = resolve_path(cfg.dataset.meta_path, repo_root)
     dataset_cfg = cfg.dataset.datasets[args.dataset]
@@ -169,7 +184,10 @@ def main() -> int:
     print(f"[InspectDataset] resolved {args.dataset} root_dir={root_dir}")
     print(f"[InspectDataset] root_dir exists={root_dir.exists()}")
     print(f"[InspectDataset] configured val_id={configured_val_id}")
-    print(f"[InspectDataset] min_pairs={args.min_pairs}")
+    print(f"[InspectDataset] input_frames={default_input_frames}")
+    print(f"[InspectDataset] target_frames={target_frames}")
+    print(f"[InspectDataset] inferred_required_pairs={inferred_required_pairs}")
+    print(f"[InspectDataset] min_pairs={args.min_pairs} effective_min_pairs={min_pairs}")
 
     if not meta_path.exists():
         print(f"[InspectDataset][ERROR] metadata does not exist: {meta_path}")
@@ -181,8 +199,8 @@ def main() -> int:
 
     print(f"[InspectDataset] loaded frame groups/items total={len(all_meta)}")
     print(f"[InspectDataset] filtered frame groups/items for {args.dataset}={len(filtered)}")
-    print_pair_stats("all", pair_stats((pair_count(v) for v in filtered.values()), args.min_pairs), args.min_pairs)
-    print_pair_stats("train", pair_stats((pair_count(v) for v in counts["train_items"].values()), args.min_pairs), args.min_pairs)
+    print_pair_stats("all", pair_stats((pair_count(v) for v in filtered.values()), min_pairs), min_pairs)
+    print_pair_stats("train", pair_stats((pair_count(v) for v in counts["train_items"].values()), min_pairs), min_pairs)
     print(f"[InspectDataset] available IDs ({len(counts['available_ids'])}): {counts['available_ids'][:50]}")
     if len(counts["available_ids"]) > 50:
         print(f"[InspectDataset] ... {len(counts['available_ids']) - 50} more IDs omitted")
@@ -192,11 +210,21 @@ def main() -> int:
     print(f"[InspectDataset] expected val candidate count={counts['expected_val_candidate_count']}")
     print(f"[InspectDataset] top ID counts={Counter(counts['id_to_count']).most_common(10)}")
 
-    offending = [(key, pair_count(value)) for key, value in counts["train_items"].items() if pair_count(value) < args.min_pairs]
+    print("[InspectDataset] train item pair checks:")
+    offending = []
+    for key, value in counts["train_items"].items():
+        raw_count = pair_count(value)
+        required = item_required_pairs(value, default_input_frames, target_frames) if str(args.min_pairs).lower() == "auto" else min_pairs
+        ok = raw_count >= required
+        uid = extract_nersemble_id(key)
+        status = "pass" if ok else "fail"
+        print(f"  - key={key} uid={uid} raw_pair_count={raw_count} effective_pair_count={required} {status}")
+        if not ok:
+            offending.append((key, raw_count, required))
     if offending:
-        print(f"[InspectDataset][ERROR] Train frame groups below min_pairs={args.min_pairs}:")
-        for key, count in offending[:50]:
-            print(f"  - {key}: pairs={count}")
+        print(f"[InspectDataset][ERROR] Train frame groups below required pair count:")
+        for key, count, required in offending[:50]:
+            print(f"  - {key}: pairs={count} required={required}")
         if len(offending) > 50:
             print(f"  ... {len(offending) - 50} more offending groups omitted")
 

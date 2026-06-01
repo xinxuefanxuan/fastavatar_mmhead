@@ -22,6 +22,31 @@ def load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_config(path: Path) -> Any:
+    from omegaconf import OmegaConf
+    return OmegaConf.load(path)
+
+
+def resolve_path(value: str | Path, base: Path) -> Path:
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    return (base / p).resolve()
+
+
+def required_pairs_from_config(config_path: Path | None) -> tuple[int, int, int]:
+    if config_path is None:
+        return 27, 0, 27
+    cfg = load_config(config_path)
+    input_frames = int(cfg.dataset.input_frames)
+    target_frames = int(cfg.dataset.target_frames)
+    return input_frames + target_frames, input_frames, target_frames
+
+
+def item_required_pairs(frame_data: dict[str, Any], default_input_frames: int, target_frames: int) -> int:
+    return int(frame_data.get("input_frames", default_input_frames)) + int(target_frames)
+
+
 def filter_nersemble(all_frame_groups: dict[str, Any]) -> dict[str, Any]:
     filtered = {}
     for path, frame_data in all_frame_groups.items():
@@ -117,10 +142,11 @@ def parse_prefer_ids(value: str | None) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a small P9.2 overfit mixed_uids metadata file from existing FastAvatar data.")
+    parser.add_argument("--config", type=Path, default=Path("configs/train/fastavatar_motion_zero_token_overfit.yaml"))
     parser.add_argument("--source_meta", type=Path, default=Path("/home/yuanyuhao/FastAvatar/datasets/mixed_uids.json"))
     parser.add_argument("--root_dir", type=Path, default=Path("/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"))
     parser.add_argument("--output", type=Path, default=Path("datasets/p9_2_overfit_mixed_uids.json"))
-    parser.add_argument("--min_pairs", type=int, default=27, help="Require each selected frame group to have at least this many camera-frame pairs.")
+    parser.add_argument("--min_pairs", default="auto", help="Required camera-frame pairs, or 'auto' to infer input_frames + target_frames from --config.")
     parser.add_argument("--max_ids", type=int, default=6, help="Select at most this many valid IDs. Empty val_id selects 5 for validation, so 6 leaves train samples.")
     parser.add_argument("--num_ids", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max_items_per_id", type=int, default=4)
@@ -131,6 +157,22 @@ def main() -> None:
     if args.num_ids is not None:
         args.max_ids = args.num_ids
 
+    config_path = resolve_path(args.config, Path.cwd()) if args.config else None
+    if str(args.min_pairs).lower() == "auto":
+        inferred_required_pairs, default_input_frames, target_frames = required_pairs_from_config(config_path)
+    else:
+        inferred_required_pairs = int(args.min_pairs)
+        if config_path and config_path.exists():
+            _, default_input_frames, target_frames = required_pairs_from_config(config_path)
+        else:
+            default_input_frames = max(inferred_required_pairs, 0)
+            target_frames = 0
+
+    print(f"[CreateP9.2Meta] config={config_path}")
+    print(f"[CreateP9.2Meta] input_frames={default_input_frames}")
+    print(f"[CreateP9.2Meta] target_frames={target_frames}")
+    print(f"[CreateP9.2Meta] inferred_required_pairs={inferred_required_pairs}")
+
     if not args.source_meta.exists():
         raise FileNotFoundError(f"source metadata not found: {args.source_meta}")
     if not args.root_dir.exists():
@@ -138,13 +180,14 @@ def main() -> None:
 
     all_meta = load_json(args.source_meta)
     filtered = filter_nersemble(all_meta)
-    print_pair_distribution("pair-count distribution before filtering", [pair_count(v) for v in filtered.values()], args.min_pairs)
+    print_pair_distribution("pair-count distribution before filtering", [pair_count(v) for v in filtered.values()], inferred_required_pairs)
 
     by_id: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
     skipped_short = 0
     skipped_missing = 0
     for clean_key, frame_data in filtered.items():
-        if pair_count(frame_data) < args.min_pairs:
+        required_pairs = item_required_pairs(frame_data, default_input_frames, target_frames)
+        if pair_count(frame_data) < required_pairs:
             skipped_short += 1
             continue
         if item_has_required_files(args.root_dir, clean_key, frame_data, args.max_pairs_to_check):
@@ -156,8 +199,8 @@ def main() -> None:
     if eligible_count == 0:
         raise RuntimeError(
             "No eligible frame groups satisfy min_pairs and file validation. "
-            f"min_pairs={args.min_pairs}, skipped_short={skipped_short}, skipped_missing={skipped_missing}. "
-            "Try lowering input_frames/target_frames in the config or lowering --min_pairs."
+            f"required_pairs={inferred_required_pairs}, skipped_short={skipped_short}, skipped_missing={skipped_missing}. "
+            "Try lowering input_frames/target_frames in the config or overriding --min_pairs."
         )
 
     preferred = parse_prefer_ids(args.prefer_ids)
@@ -168,13 +211,13 @@ def main() -> None:
     selected_ids = sorted(ordered_ids[: min(args.max_ids, len(ordered_ids))])
 
     out: dict[str, Any] = {}
-    selected_groups: list[tuple[str, int]] = []
+    selected_groups: list[tuple[str, int, int]] = []
     for uid in selected_ids:
         items = list(by_id[uid])
         rng.shuffle(items)
         for clean_key, frame_data in items[: args.max_items_per_id]:
             out[prefixed_key(clean_key)] = frame_data
-            selected_groups.append((prefixed_key(clean_key), pair_count(frame_data)))
+            selected_groups.append((prefixed_key(clean_key), pair_count(frame_data), item_required_pairs(frame_data, default_input_frames, target_frames)))
 
     if not out:
         raise RuntimeError(
@@ -188,6 +231,7 @@ def main() -> None:
     print(f"[CreateP9.2Meta] root_dir={args.root_dir}")
     print(f"[CreateP9.2Meta] output={args.output}")
     print(f"[CreateP9.2Meta] min_pairs={args.min_pairs}")
+    print(f"[CreateP9.2Meta] effective_required_pairs={inferred_required_pairs}")
     print(f"[CreateP9.2Meta] skipped_short={skipped_short}")
     print(f"[CreateP9.2Meta] skipped_missing_or_invalid={skipped_missing}")
     print(f"[CreateP9.2Meta] eligible frame groups={eligible_count}")
@@ -195,8 +239,8 @@ def main() -> None:
     print(f"[CreateP9.2Meta] item count={len(out)}")
     print(f"[CreateP9.2Meta] per-ID counts={dict(Counter(extract_id(k[len('nersemble/'):]) for k in out))}")
     print("[CreateP9.2Meta] selected frame groups with pair counts:")
-    for key, count in selected_groups:
-        print(f"  - {key}: pairs={count}")
+    for key, count, required in selected_groups:
+        print(f"  - {key}: pairs={count} required={required}")
     print("[CreateP9.2Meta] No processed data was copied; metadata references the existing root_dir.")
 
 
