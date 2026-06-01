@@ -28,11 +28,11 @@ if [[ ! -f "${META_PATH}" ]]; then
   cat >&2 <<EOF
 [P9.2][ERROR] Configured meta_path does not exist: ${META_PATH}
 Create it without copying large data by running:
-  python scripts/debug/create_p9_2_overfit_metadata.py
+  python scripts/debug/create_p9_2_overfit_metadata.py --min_pairs 27
 EOF
   exit 2
 fi
 
-python scripts/debug/inspect_fastavatar_dataset_ids.py --config "${CONFIG_PATH}" --require_train
+python scripts/debug/inspect_fastavatar_dataset_ids.py --config "${CONFIG_PATH}" --min_pairs 27 --require_train
 
 python FastAvatar/launch.py train.fastavatar --config "${CONFIG_PATH}" "$@"
