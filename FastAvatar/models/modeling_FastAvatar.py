@@ -81,6 +81,7 @@ class ModelFastAvatar(nn.Module):
                  motion_token_norm_stats: str = None,
                  motion_token_expr_dim: int = 50,
                  motion_token_pad_to_dim: int = 96,
+                 motion_token_train_adapter_only_strict: bool = False,
                  **kwargs,
                  ):
         super().__init__()
@@ -106,6 +107,7 @@ class ModelFastAvatar(nn.Module):
         self.motion_token_norm_stats = motion_token_norm_stats
         self.motion_token_expr_dim = int(motion_token_expr_dim)
         self.motion_token_pad_to_dim = int(motion_token_pad_to_dim)
+        self.motion_token_train_adapter_only_strict = bool(motion_token_train_adapter_only_strict)
         self.motion_token_norm_mean = None
         self.motion_token_norm_std = None
         if self.motion_token_norm_stats:
@@ -216,14 +218,25 @@ class ModelFastAvatar(nn.Module):
     def freeze_backbone_keep_motion_token_trainable(self):
         for param in self.parameters():
             param.requires_grad = False
-        if self.motion_token_adapter is not None:
-            for param in self.motion_token_adapter.parameters():
-                param.requires_grad = True
+        if self.motion_token_adapter is None:
+            raise RuntimeError("freeze_backbone_for_motion_token=True requires use_motion_token=True and a MotionTokenAdapter")
+        for param in self.motion_token_adapter.parameters():
+            param.requires_grad = True
         trainable = [(name, p.numel()) for name, p in self.named_parameters() if p.requires_grad]
         total = sum(n for _, n in trainable)
         print(f"[MotionTokenAdapter] freeze_backbone_for_motion_token=True; trainable parameter count={total}")
         for name, count in trainable:
             print(f"[MotionTokenAdapter] trainable: {name} ({count})")
+        adapter_trainable = [name for name, _ in trainable if name.startswith("motion_token_adapter.")]
+        if not adapter_trainable:
+            raise RuntimeError("MotionTokenAdapter has no trainable parameters after freezing the backbone")
+        if self.motion_token_train_adapter_only_strict:
+            non_adapter = [name for name, _ in trainable if not name.startswith("motion_token_adapter.")]
+            if non_adapter:
+                raise RuntimeError(
+                    "motion_token_train_adapter_only_strict=True but non-adapter parameters remain trainable: "
+                    + ", ".join(non_adapter[:20])
+                )
 
     def _prepare_motion_token_input(self, motion_token_input, batch_size: int, device, dtype):
         if not self.use_motion_token:

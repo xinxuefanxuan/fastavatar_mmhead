@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${CONFIG_PATH:-configs/train/fastavatar_motion_zero_token_overfit_smoke.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-configs/train/fastavatar_motion_zero_token_overfit_tiny.yaml}"
 
 export FASTAVATAR_TOKEN_DEBUG="${FASTAVATAR_TOKEN_DEBUG:-1}"
 export FASTAVATAR_DATASET_FAIL_FAST="${FASTAVATAR_DATASET_FAIL_FAST:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 META_PATH=$(python - "$CONFIG_PATH" <<'PY'
 from pathlib import Path
@@ -20,21 +21,24 @@ PY
 
 echo "[P9.2] Running motion-zero + GT motion-token overfit"
 echo "[P9.2] cwd=$(pwd)"
-echo "[P9.2] Config: ${CONFIG_PATH}"
+echo "[P9.2] CONFIG_PATH=${CONFIG_PATH}"
 echo "[P9.2] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "[P9.2] FASTAVATAR_TOKEN_DEBUG=${FASTAVATAR_TOKEN_DEBUG}"
 echo "[P9.2] FASTAVATAR_DATASET_FAIL_FAST=${FASTAVATAR_DATASET_FAIL_FAST}"
+echo "[P9.2] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 echo "[P9.2] meta_path=${META_PATH}"
 
-if [[ ! -f "${META_PATH}" ]]; then
-  cat >&2 <<EOF
-[P9.2][ERROR] Configured meta_path does not exist: ${META_PATH}
-Create it without copying large data by running:
-  python scripts/debug/create_p9_2_overfit_metadata.py --config "${CONFIG_PATH}" --min_pairs auto
-EOF
-  exit 2
-fi
+python scripts/debug/create_p9_2_overfit_metadata.py \
+  --config "${CONFIG_PATH}" \
+  --min_pairs auto \
+  --max_ids 6 \
+  --max_items_per_id 4 \
+  --prefer_ids 036 \
+  --output datasets/p9_2_overfit_mixed_uids.json
 
-python scripts/debug/inspect_fastavatar_dataset_ids.py --config "${CONFIG_PATH}" --min_pairs auto --require_train
+python scripts/debug/inspect_fastavatar_dataset_ids.py \
+  --config "${CONFIG_PATH}" \
+  --min_pairs auto \
+  --require_train
 
 python FastAvatar/launch.py train.fastavatar --config "${CONFIG_PATH}" "$@"
