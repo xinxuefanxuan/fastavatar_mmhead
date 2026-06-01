@@ -295,6 +295,16 @@ class ModelFastAvatar(nn.Module):
             print(f"[FASTAVATAR_TOKEN_DEBUG] zero_flame_motion=True; zeroed_fields={zeroed}")
         return out
 
+    def _flame_motion_norms(self, flame_params):
+        norms = {}
+        for key in ["expr", "neck_pose", "jaw_pose"]:
+            value = flame_params.get(key) if isinstance(flame_params, dict) else None
+            if isinstance(value, torch.Tensor):
+                norms[key] = float(value.detach().float().norm().cpu())
+            else:
+                norms[key] = "missing"
+        return norms
+
     def _frame_average(self, value: torch.Tensor) -> torch.Tensor:
         if value.ndim == 3:
             return value.mean(dim=1)
@@ -523,15 +533,31 @@ class ModelFastAvatar(nn.Module):
         Returns:
             Dict containing concatenated render results for all frames
         """
+        # `inf_flame_params` is already the renderer-ready FLAME dictionary from the caller.
+        # In P9.2, forward()/infer_images() build the motion token from the original FLAME
+        # tensors first, then pass the post-zeroing FLAME dictionary here. Keep a local
+        # alias so all renderer uses are scoped and explicit.
+        render_flame_params = inf_flame_params
         _token_debug(
             "render_multiple_frames/input",
             latent_points=latent_points,
             query_points=query_points,
-            inf_flame_params=render_flame_params,
+            inf_flame_params=inf_flame_params,
+            render_flame_params=render_flame_params,
             c2ws=c2ws,
             intrs=intrs,
             bg_colors=bg_colors,
         )
+        if _token_debug_enabled():
+            debug_zeroed_params = self._clone_and_zero_flame_motion(inf_flame_params)
+            print(f"[FASTAVATAR_TOKEN_DEBUG] render_multiple_frames/zero_flame_motion={self.zero_flame_motion}")
+            print(f"[FASTAVATAR_TOKEN_DEBUG] render_multiple_frames/inf_flame_keys={sorted(inf_flame_params.keys())}")
+            print(f"[FASTAVATAR_TOKEN_DEBUG] render_multiple_frames/render_flame_keys={sorted(render_flame_params.keys())}")
+            print(
+                "[FASTAVATAR_TOKEN_DEBUG] render_multiple_frames/motion_norms "
+                f"before_zero={self._flame_motion_norms(inf_flame_params)} "
+                f"after_zero={self._flame_motion_norms(debug_zeroed_params)}"
+            )
         # Calculate number of chunks
         if chunk_size >= N_inf:
             # Render all frames at once
@@ -547,7 +573,7 @@ class ModelFastAvatar(nn.Module):
 
                 # Extract chunk-specific parameters
                 chunk_flame_params = {}
-                for k, v in inf_flame_params.items():
+                for k, v in render_flame_params.items():
                     if isinstance(v, torch.Tensor):
                         if k == "betas":
                             chunk_flame_params[k] = v[:, 0:1]  # [B, 1, ...]
