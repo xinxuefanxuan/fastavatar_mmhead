@@ -2,7 +2,7 @@ experiment:
     type: fastavatar
     seed: 42
     parent: fastavatar
-    child: fastavatar
+    child: fastavatar_motion_zero_token_overfit_smoke
 
 model:
     pretrained_model_path: "./model_zoo/fastavatar/model.safetensors"
@@ -53,37 +53,37 @@ model:
     rendering_chunk_size_infer: 128
 
     # P9.1 optional MotionTokenAdapter (disabled by default; preserves baseline behavior)
-    use_motion_token: false
+    use_motion_token: true
     motion_token_input_dim: 96
     motion_token_hidden_dim: null
     motion_token_mode: "add_query"
     motion_token_scale: 1.0
-    zero_flame_motion: false
-    freeze_backbone_for_motion_token: false
-    motion_token_source: "none"
-    motion_token_norm_stats: null
+    zero_flame_motion: true
+    freeze_backbone_for_motion_token: true
+    motion_token_source: "frame_flame_gt"
+    motion_token_norm_stats: "outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json"
     motion_token_expr_dim: 50
     motion_token_pad_to_dim: 96
 
 dataset:
-    input_frames: 256
-    target_frames: 16
+    input_frames: 128
+    target_frames: 8
     render_image_res: 512
     source_image_res: 512
-    num_train_workers: 2
-    num_val_workers: 1
+    num_train_workers: 0
+    num_val_workers: 0
     pin_mem: true
-    val_num: 128
+    val_num: 2
     multiply: 2
     # Multiple datasets config
-    meta_path: "./datasets/mixed_uids.json"
+    meta_path: "./datasets/p9_2_overfit_mixed_uids.json"
     datasets:
         nersemble:
-            root_dir: "/ssd_data/sjd/data/nersemble_fastavatar_unified_full"
+            root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
             task_type: "unified"
-            val_id: ['089','090'] # '309', '146', '123', '370', '204'
+            val_id: ['036'] # Smoke: explicit ID known from generated P9.2 metadata examples; run inspect_fastavatar_dataset_ids.py if unavailable
         # vfhq:
-        #     root_dir: YOUR_DATA_PATH
+        #     root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
         #     task_type: "monocular"
         #     val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
 
@@ -111,14 +111,14 @@ train:
         type: cosine
         warmup_real_iters: 0
     batch_size: 1
-    accum_steps: 8
-    epochs: 5
-    debug_global_steps: null
+    accum_steps: 1
+    epochs: 1
+    debug_global_steps: 20
     resume: ""
 
 val:
     batch_size: 1
-    global_step_period: 500
+    global_step_period: 10
     debug_batches: null
     save_images: true
     save_dir: "./exps/val_perf"
@@ -128,7 +128,7 @@ saver:
     auto_resume: true
     load_model: null
     checkpoint_root: "./exps/checkpoints"
-    checkpoint_global_steps: 500
+    checkpoint_global_steps: 10
     checkpoint_keep_level: 3
 
 logger:
