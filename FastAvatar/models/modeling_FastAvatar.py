@@ -92,6 +92,8 @@ class ModelFastAvatar(nn.Module):
         self.gs_fusion = gs_fusion
         self.rendering_chunk_size_train = kwargs.get("rendering_chunk_size_train", 16)
         self.rendering_chunk_size_infer = kwargs.get("rendering_chunk_size_infer", 128)
+        debug_max_query_points = kwargs.get("debug_max_query_points", None)
+        self.debug_max_query_points = None if debug_max_query_points is None else int(debug_max_query_points)
         self.num_base_frames = num_base_frames
         self.if_framepack = if_framepack
         self.framepack_compression_level = framepack_compression_level
@@ -432,6 +434,42 @@ class ModelFastAvatar(nn.Module):
 
             return image_feats, None, None, None
 
+    def _query_point_subsample_indices(self, num_points: int, device):
+        if self.debug_max_query_points is None or self.debug_max_query_points <= 0:
+            return None
+        if num_points <= self.debug_max_query_points:
+            return None
+        # Deterministic coverage across the full point set. This is debug-only and opt-in;
+        # the default None preserves original full-point FastAvatar behavior.
+        return torch.linspace(0, num_points - 1, steps=self.debug_max_query_points, device=device).long()
+
+    def _subsample_query_points_for_debug(self, query_points, label: str):
+        idx = self._query_point_subsample_indices(query_points.shape[-2], query_points.device)
+        if idx is None:
+            return query_points
+        out = query_points.index_select(-2, idx)
+        if _token_debug_enabled():
+            print(
+                f"[FASTAVATAR_TOKEN_DEBUG] debug_max_query_points/{label}: "
+                f"before={list(query_points.shape)} after={list(out.shape)} max={self.debug_max_query_points}"
+            )
+        return out
+
+    def _subsample_render_points_for_debug(self, latent_points, query_points):
+        idx = self._query_point_subsample_indices(query_points.shape[1], query_points.device)
+        if idx is None:
+            return latent_points, query_points
+        latent_out = latent_points.index_select(1, idx)
+        query_out = query_points.index_select(1, idx)
+        if _token_debug_enabled():
+            print(
+                "[FASTAVATAR_TOKEN_DEBUG] debug_max_query_points/render: "
+                f"latent_before={list(latent_points.shape)} query_before={list(query_points.shape)} "
+                f"latent_after={list(latent_out.shape)} query_after={list(query_out.shape)} "
+                f"max={self.debug_max_query_points}"
+            )
+        return latent_out, query_out
+
     def forward_transformer(self, image_feats, query_points, query_feats=None, compressed_cond=None, spatial_compression=None, motion_token_input=None):
         """
         Args:
@@ -495,6 +533,7 @@ class ModelFastAvatar(nn.Module):
         query_points_transformer = query_points[:, 0:1].repeat(1, base_frames, 1, 1)
         if compressed_cond is not None:
             query_points_transformer = torch.cat([query_points_transformer, query_points_transformer[:, 0:1]], dim=1)
+        query_points_transformer = self._subsample_query_points_for_debug(query_points_transformer, "transformer")
 
         # Reconstruction Transformer
         latent_points = self.forward_transformer(
@@ -538,6 +577,7 @@ class ModelFastAvatar(nn.Module):
         # tensors first, then pass the post-zeroing FLAME dictionary here. Keep a local
         # alias so all renderer uses are scoped and explicit.
         render_flame_params = inf_flame_params
+        latent_points, query_points = self._subsample_render_points_for_debug(latent_points, query_points)
         _token_debug(
             "render_multiple_frames/input",
             latent_points=latent_points,

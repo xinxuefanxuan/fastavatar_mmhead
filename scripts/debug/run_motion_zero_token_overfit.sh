@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${CONFIG_PATH:-configs/train/fastavatar_motion_zero_token_overfit_tiny.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-configs/train/fastavatar_motion_zero_token_overfit_micro.yaml}"
 
 export FASTAVATAR_TOKEN_DEBUG="${FASTAVATAR_TOKEN_DEBUG:-1}"
 export FASTAVATAR_DATASET_FAIL_FAST="${FASTAVATAR_DATASET_FAIL_FAST:-1}"
@@ -40,5 +40,9 @@ python scripts/debug/inspect_fastavatar_dataset_ids.py \
   --config "${CONFIG_PATH}" \
   --min_pairs auto \
   --require_train
+
+python scripts/debug/inspect_p9_2_runtime_config.py \
+  --config "${CONFIG_PATH}" \
+  --require_micro
 
 python FastAvatar/launch.py train.fastavatar --config "${CONFIG_PATH}" "$@"
