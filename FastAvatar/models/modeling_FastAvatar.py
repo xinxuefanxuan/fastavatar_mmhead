@@ -94,6 +94,13 @@ class ModelFastAvatar(nn.Module):
         self.rendering_chunk_size_infer = kwargs.get("rendering_chunk_size_infer", 128)
         debug_max_query_points = kwargs.get("debug_max_query_points", None)
         self.debug_max_query_points = None if debug_max_query_points is None else int(debug_max_query_points)
+        self.debug_skip_renderer = bool(kwargs.get("debug_skip_renderer", False))
+        self.debug_latent_smoke_loss = bool(kwargs.get("debug_latent_smoke_loss", False))
+        if self.debug_max_query_points is not None and not self.debug_skip_renderer:
+            raise ValueError(
+                "debug_max_query_points currently supports latent-only micro smoke runs. "
+                "Set model.debug_skip_renderer=true or set debug_max_query_points=null for renderer runs."
+            )
         self.num_base_frames = num_base_frames
         self.if_framepack = if_framepack
         self.framepack_compression_level = framepack_compression_level
@@ -455,21 +462,6 @@ class ModelFastAvatar(nn.Module):
             )
         return out
 
-    def _subsample_render_points_for_debug(self, latent_points, query_points):
-        idx = self._query_point_subsample_indices(query_points.shape[1], query_points.device)
-        if idx is None:
-            return latent_points, query_points
-        latent_out = latent_points.index_select(1, idx)
-        query_out = query_points.index_select(1, idx)
-        if _token_debug_enabled():
-            print(
-                "[FASTAVATAR_TOKEN_DEBUG] debug_max_query_points/render: "
-                f"latent_before={list(latent_points.shape)} query_before={list(query_points.shape)} "
-                f"latent_after={list(latent_out.shape)} query_after={list(query_out.shape)} "
-                f"max={self.debug_max_query_points}"
-            )
-        return latent_out, query_out
-
     def forward_transformer(self, image_feats, query_points, query_feats=None, compressed_cond=None, spatial_compression=None, motion_token_input=None):
         """
         Args:
@@ -577,7 +569,6 @@ class ModelFastAvatar(nn.Module):
         # tensors first, then pass the post-zeroing FLAME dictionary here. Keep a local
         # alias so all renderer uses are scoped and explicit.
         render_flame_params = inf_flame_params
-        latent_points, query_points = self._subsample_render_points_for_debug(latent_points, query_points)
         _token_debug(
             "render_multiple_frames/input",
             latent_points=latent_points,
@@ -709,6 +700,19 @@ class ModelFastAvatar(nn.Module):
 
         # Forward: encoder + transformer, using GT FLAME params for query points
         latent_points, query_points = self.forward_latent_points(input_image, input_flame_params, motion_token_input=motion_token_input)
+        if self.debug_skip_renderer:
+            smoke_loss = latent_points.float().pow(2).mean()
+            _token_debug(
+                "forward/debug_latent_smoke",
+                debug_skip_renderer=self.debug_skip_renderer,
+                debug_latent_smoke_loss=self.debug_latent_smoke_loss,
+                latent_points=latent_points,
+                smoke_loss=smoke_loss,
+            )
+            return {
+                "latent_smoke_loss": smoke_loss,
+                "gs_stats": None,
+            }
         
         del input_image, target_image
         if torch.cuda.is_available():
@@ -771,6 +775,15 @@ class ModelFastAvatar(nn.Module):
         motion_token_input = self._resolve_motion_token_input(motion_token_input, inf_flame_params)
         render_flame_params = self._clone_and_zero_flame_motion(inf_flame_params)
         latent_points, query_points = self.forward_latent_points(image, input_flame_params, motion_token_input=motion_token_input)
+        if self.debug_skip_renderer:
+            smoke_loss = latent_points.float().pow(2).mean()
+            _token_debug(
+                "infer_images/debug_latent_smoke",
+                debug_skip_renderer=self.debug_skip_renderer,
+                latent_points=latent_points,
+                smoke_loss=smoke_loss,
+            )
+            return {"latent_smoke_loss": smoke_loss, "gs_stats": None}
 
         # Clean up input tensors immediately after forward_latent_points
         del image, input_c2ws, input_intrs

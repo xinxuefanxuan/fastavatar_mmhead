@@ -45,6 +45,8 @@ def main() -> int:
     model_source_res = int(cfg.model.source_image_res)
     debug_max_query_points = get_nested(cfg, "model.debug_max_query_points", None)
     debug_max_query_points_int = None if debug_max_query_points is None else int(debug_max_query_points)
+    debug_skip_renderer = bool(get_nested(cfg, "model.debug_skip_renderer", False))
+    debug_latent_smoke_loss = bool(get_nested(cfg, "model.debug_latent_smoke_loss", False))
 
     print(f"[P9.2 Runtime] config={cfg_path}")
     print(f"[P9.2 Runtime] dataset.input_frames={input_frames}")
@@ -55,6 +57,8 @@ def main() -> int:
     print(f"[P9.2 Runtime] model.rendering_chunk_size_train={get_nested(cfg, 'model.rendering_chunk_size_train')}")
     print(f"[P9.2 Runtime] model.rendering_chunk_size_infer={get_nested(cfg, 'model.rendering_chunk_size_infer')}")
     print(f"[P9.2 Runtime] model.debug_max_query_points={debug_max_query_points}")
+    print(f"[P9.2 Runtime] model.debug_skip_renderer={debug_skip_renderer}")
+    print(f"[P9.2 Runtime] model.debug_latent_smoke_loss={debug_latent_smoke_loss}")
     print(f"[P9.2 Runtime] model.use_motion_token={get_nested(cfg, 'model.use_motion_token')}")
     print(f"[P9.2 Runtime] model.zero_flame_motion={get_nested(cfg, 'model.zero_flame_motion')}")
     print(f"[P9.2 Runtime] model.motion_token_source={get_nested(cfg, 'model.motion_token_source')}")
@@ -73,10 +77,11 @@ def main() -> int:
             failures.append(f"dataset.target_frames={target_frames} > 1")
         if source_res > 128 or render_res > 128 or model_source_res > 128:
             failures.append(f"resolution too large: dataset source/render={source_res}/{render_res}, model source={model_source_res}")
-        if debug_max_query_points_int is None:
-            failures.append("model.debug_max_query_points is missing/null")
-        elif debug_max_query_points_int > 4096:
-            failures.append(f"model.debug_max_query_points={debug_max_query_points_int} > 4096")
+        if debug_skip_renderer:
+            if not debug_latent_smoke_loss:
+                failures.append("model.debug_skip_renderer=true requires model.debug_latent_smoke_loss=true for this smoke path")
+        elif debug_max_query_points_int is not None:
+            failures.append("renderer micro smoke requires model.debug_max_query_points=null until renderer-compatible per-frame subsampling is implemented")
         if failures:
             print("[P9.2 Runtime][ERROR] Config is not micro-safe:")
             for failure in failures:

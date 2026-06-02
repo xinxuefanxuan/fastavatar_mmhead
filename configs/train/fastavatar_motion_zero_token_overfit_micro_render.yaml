@@ -2,7 +2,7 @@ experiment:
     type: fastavatar
     seed: 42
     parent: fastavatar
-    child: fastavatar_motion_zero_token_overfit_micro
+    child: fastavatar_motion_zero_token_overfit_micro_render
 
 model:
     pretrained_model_path: "./model_zoo/fastavatar/model.safetensors"
@@ -52,8 +52,8 @@ model:
     rendering_chunk_size_train: 1
     rendering_chunk_size_infer: 8
     debug_max_query_points: null
-    debug_skip_renderer: true
-    debug_latent_smoke_loss: true
+    debug_skip_renderer: false
+    debug_latent_smoke_loss: false
 
     # P9.1 optional MotionTokenAdapter (disabled by default; preserves baseline behavior)
     use_motion_token: true
