@@ -144,8 +144,8 @@ def parse_prefer_ids(value: str | None) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a small P9.2 overfit mixed_uids metadata file from existing FastAvatar data.")
     parser.add_argument("--config", type=Path, default=Path("configs/train/fastavatar_motion_zero_token_overfit.yaml"))
-    parser.add_argument("--source_meta", type=Path, default=Path("/home/yuanyuhao/FastAvatar/datasets/mixed_uids.json"))
-    parser.add_argument("--root_dir", type=Path, default=Path("/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"))
+    parser.add_argument("--src_meta", "--source_meta", dest="source_meta", type=Path, default=None, help="Source mixed_uids.json to subset. Defaults to ./datasets/mixed_uids.json if omitted.")
+    parser.add_argument("--root_dir", type=Path, default=None, help="Processed Nersemble FastAvatar root. Defaults to config dataset root_dir if omitted.")
     parser.add_argument("--output", type=Path, default=Path("datasets/p9_2_overfit_mixed_uids.json"))
     parser.add_argument("--min_pairs", default="auto", help="Required camera-frame pairs, or 'auto' to infer input_frames + target_frames from --config.")
     parser.add_argument("--max_ids", type=int, default=6, help="Select at most this many valid IDs. Empty val_id selects 5 for validation, so 6 leaves train samples.")
@@ -165,7 +165,23 @@ def main() -> None:
     else:
         required_pairs = int(args.min_pairs)
 
+    repo_root = Path.cwd()
+    cfg = load_config(config_path) if config_path else None
+    if args.source_meta is None:
+        args.source_meta = Path("datasets/mixed_uids.json")
+    if args.root_dir is None:
+        if cfg is None:
+            args.root_dir = Path("data/nersemble_fastavatar_unified_full")
+        else:
+            args.root_dir = Path(str(cfg.dataset.datasets.nersemble.root_dir))
+    args.source_meta = resolve_path(args.source_meta, repo_root)
+    args.root_dir = resolve_path(args.root_dir, repo_root)
+    args.output = resolve_path(args.output, repo_root)
+
     print(f"[CreateP9.2Meta] config={config_path}")
+    print(f"[CreateP9.2Meta] source_meta={args.source_meta}")
+    print(f"[CreateP9.2Meta] root_dir={args.root_dir}")
+    print(f"[CreateP9.2Meta] output={args.output}")
     print(f"[CreateP9.2Meta] input_frames={default_input_frames}")
     print(f"[CreateP9.2Meta] target_frames={target_frames}")
     print(f"[CreateP9.2Meta] inferred_required_pairs={config_required_pairs}")

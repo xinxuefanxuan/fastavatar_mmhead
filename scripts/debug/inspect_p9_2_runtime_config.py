@@ -47,8 +47,16 @@ def main() -> int:
     debug_max_query_points_int = None if debug_max_query_points is None else int(debug_max_query_points)
     debug_skip_renderer = bool(get_nested(cfg, "model.debug_skip_renderer", False))
     debug_latent_smoke_loss = bool(get_nested(cfg, "model.debug_latent_smoke_loss", False))
+    meta_path = resolve_path(cfg.dataset.meta_path, repo_root)
+    root_dir = resolve_path(cfg.dataset.datasets.nersemble.root_dir, repo_root)
+    val_id = list(getattr(cfg.dataset.datasets.nersemble, "val_id", []) or [])
 
     print(f"[P9.2 Runtime] config={cfg_path}")
+    print(f"[P9.2 Runtime] dataset.meta_path={meta_path}")
+    print(f"[P9.2 Runtime] dataset.meta_path exists={meta_path.exists()}")
+    print(f"[P9.2 Runtime] dataset.datasets.nersemble.root_dir={root_dir}")
+    print(f"[P9.2 Runtime] dataset.datasets.nersemble.root_dir exists={root_dir.exists()}")
+    print(f"[P9.2 Runtime] dataset.datasets.nersemble.val_id={val_id}")
     print(f"[P9.2 Runtime] dataset.input_frames={input_frames}")
     print(f"[P9.2 Runtime] dataset.target_frames={target_frames}")
     print(f"[P9.2 Runtime] dataset.source_image_res={source_res}")
@@ -77,6 +85,11 @@ def main() -> int:
             failures.append(f"dataset.target_frames={target_frames} > 1")
         if source_res > 128 or render_res > 128 or model_source_res > 128:
             failures.append(f"resolution too large: dataset source/render={source_res}/{render_res}, model source={model_source_res}")
+        stale_home = "/home/" + "yuanyuhao"
+        if stale_home in str(root_dir):
+            failures.append(f"stale root_dir contains {stale_home}: {root_dir}")
+        if not root_dir.exists():
+            failures.append(f"root_dir does not exist: {root_dir}")
         if debug_skip_renderer:
             if not debug_latent_smoke_loss:
                 failures.append("model.debug_skip_renderer=true requires model.debug_latent_smoke_loss=true for this smoke path")

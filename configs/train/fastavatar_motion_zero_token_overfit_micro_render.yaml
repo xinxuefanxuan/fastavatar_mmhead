@@ -83,11 +83,11 @@ dataset:
     meta_path: "./datasets/p9_2_overfit_mixed_uids.json"
     datasets:
         nersemble:
-            root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
+            root_dir: "./data/nersemble_fastavatar_unified_full"
             task_type: "unified"
-            val_id: ['036'] # Tiny smoke: run create_p9_2_overfit_metadata.py with --prefer_ids 036; choose another valid ID if unavailable
+            val_id: [] # Filled by scripts/debug/run_motion_zero_token_overfit.sh in a resolved runtime config
         # vfhq:
-        #     root_dir: "/home/yuanyuhao/FastAvatar/data/nersemble_fastavatar_unified_full"
+        #     root_dir: "./data/nersemble_fastavatar_unified_full"
         #     task_type: "monocular"
         #     val_id: [] # '98tIutcmLfo', '2Bw4XUWgx6U', 'NoCALyAt1Os', 'LANE2TzVuLQ', 'JV5Z6eltAw'
 

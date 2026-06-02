@@ -190,6 +190,13 @@ def main() -> int:
     print(f"[InspectDataset] inferred_required_pairs={config_required_pairs}")
     print(f"[InspectDataset] min_pairs={args.min_pairs} effective_required_pairs={required_pairs}")
 
+    stale_home = "/home/" + "yuanyuhao"
+    if args.require_train and stale_home in str(root_dir):
+        print(f"[InspectDataset][ERROR] stale root_dir contains {stale_home}: {root_dir}")
+        return 6
+    if args.require_train and not root_dir.exists():
+        print(f"[InspectDataset][ERROR] root_dir does not exist: {root_dir}")
+        return 5
     if not meta_path.exists():
         print(f"[InspectDataset][ERROR] metadata does not exist: {meta_path}")
         return 2 if args.require_train else 0
@@ -229,6 +236,9 @@ def main() -> int:
         if len(offending) > 50:
             print(f"  ... {len(offending) - 50} more offending groups omitted")
 
+    if args.require_train and counts["invalid_val_id"]:
+        print(f"[InspectDataset][ERROR] configured val_id contains invalid IDs: {counts['invalid_val_id']}")
+        return 7
     if args.require_train and counts["expected_train_count"] <= 0:
         print("[InspectDataset][ERROR] expected train count is 0. Create overfit metadata or choose a valid val_id split first.")
         return 3
