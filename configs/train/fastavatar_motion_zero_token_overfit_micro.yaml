@@ -132,7 +132,7 @@ saver:
     auto_resume: true
     load_model: null
     checkpoint_root: "./exps/checkpoints"
-    checkpoint_global_steps: 999999
+    checkpoint_global_steps: 1
     checkpoint_keep_level: 3
 
 logger:
