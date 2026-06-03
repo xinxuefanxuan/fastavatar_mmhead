@@ -132,13 +132,16 @@ class FastAvatarTrainer(Trainer):
             use_teeth=getattr(cfg.model, 'add_teeth', True)
         )
 
+        num_train_workers = int(cfg.dataset.num_train_workers)
+        num_val_workers = int(cfg.dataset.num_val_workers)
+
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=cfg.train.batch_size,
             shuffle=True,
-            num_workers=cfg.dataset.num_train_workers,
+            num_workers=num_train_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_train_workers > 0),
             drop_last=True
         )
 
@@ -146,9 +149,9 @@ class FastAvatarTrainer(Trainer):
             val_dataset,
             batch_size=cfg.val.batch_size,
             shuffle=False,
-            num_workers=cfg.dataset.num_val_workers,
+            num_workers=num_val_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_val_workers > 0),
             drop_last=False
         )
 
@@ -219,6 +222,21 @@ class FastAvatarTrainer(Trainer):
             uid=uid
         )
         outputs['full_landmarks'] = landmarks
+
+        if getattr(self.cfg.model, 'debug_latent_smoke_loss', False):
+            if 'latent_smoke_loss' not in outputs:
+                raise RuntimeError("model.debug_latent_smoke_loss=True requires model output key 'latent_smoke_loss'")
+            total_loss = outputs['latent_smoke_loss']
+            loss_dict = {
+                'total_loss': total_loss,
+                'loss_renderer': total_loss,
+                'latent_smoke_loss': total_loss,
+                'r_pixel': None, 'r_perceptual': None, 'r_ssim': None,
+                'r_offset': None, 'r_pruning': None, 'r_id': None,
+                'avg_remaining_gs': None, 'prune_percentage': None,
+            }
+            del uid, input_image, target_image, input_c2ws, target_c2ws, input_intrs, target_intrs, input_bg_colors, target_bg_colors, input_masks, target_masks, landmarks
+            return outputs, total_loss, loss_dict
 
         loss_renderer = 0.
         loss_r_pixel = None
@@ -300,6 +318,15 @@ class FastAvatarTrainer(Trainer):
 
                 # Single backward + step
                 self.accelerator.backward(total_loss)
+                if getattr(self.cfg.model, 'debug_latent_smoke_loss', False) and self.accelerator.is_main_process:
+                    grad_sq_sum = 0.0
+                    grad_param_count = 0
+                    for name, param in self.model.named_parameters():
+                        if name.startswith('motion_token_adapter.') and param.grad is not None:
+                            grad_sq_sum += float(param.grad.detach().float().pow(2).sum().cpu())
+                            grad_param_count += param.numel()
+                    grad_norm = math.sqrt(grad_sq_sum) if grad_sq_sum > 0.0 else 0.0
+                    print(f"[P9.2 latent smoke] MotionTokenAdapter grad_norm={grad_norm:.6e} grad_param_count={grad_param_count}")
 
                 if self.accelerator.sync_gradients and self.cfg.train.optim.clip_grad_norm > 0.:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.train.optim.clip_grad_norm)
