@@ -302,22 +302,159 @@ def load_model_for_variant(cfg: Any, adapter_ckpt: Path | None, device: torch.de
     return model, loaded_adapter
 
 
+IMAGE_KEY_PRIORITY = (
+    "comp_rgb",
+    "render_rgb",
+    "rgb",
+    "image",
+    "pred_rgb",
+    "pred_image",
+    "rendered_image",
+)
+
+
+def _tensor_min_max(tensor: torch.Tensor) -> tuple[float | None, float | None]:
+    if tensor.numel() == 0:
+        return None, None
+    tensor = tensor.detach()
+    if not torch.is_floating_point(tensor):
+        tensor = tensor.float()
+    finite = tensor[torch.isfinite(tensor)]
+    if finite.numel() == 0:
+        return None, None
+    return float(finite.min().cpu()), float(finite.max().cpu())
+
+
+def print_output_debug_shapes(outputs: Any, prefix: str = "outputs") -> None:
+    """Print nested output types/shapes for debugging image selection."""
+    def visit(obj: Any, path: str) -> None:
+        if torch.is_tensor(obj):
+            t_min, t_max = _tensor_min_max(obj)
+            print(
+                f"[P9.2ABC-EVAL][OutputShape] {path}: "
+                f"type=tensor shape={list(obj.shape)} dtype={obj.dtype} min={t_min} max={t_max}"
+            )
+        elif isinstance(obj, dict):
+            print(f"[P9.2ABC-EVAL][OutputShape] {path}: type=dict keys={list(obj.keys())}")
+            for key, value in obj.items():
+                visit(value, f"{path}.{key}")
+        elif isinstance(obj, (list, tuple)):
+            print(f"[P9.2ABC-EVAL][OutputShape] {path}: type={type(obj).__name__} len={len(obj)}")
+            for idx, value in enumerate(obj):
+                visit(value, f"{path}[{idx}]")
+        else:
+            print(f"[P9.2ABC-EVAL][OutputShape] {path}: type={type(obj).__name__}")
+
+    visit(outputs, prefix)
+
+
+def _is_image_channel_count(channels: int) -> bool:
+    return int(channels) in (1, 3, 4)
+
+
+def _normalize_image_tensor(img: torch.Tensor) -> torch.Tensor:
+    img = img.detach().float().cpu()
+    if img.numel() > 0:
+        img_min = float(img.min())
+        img_max = float(img.max())
+        if img_min < 0.0 and img_max <= 1.0:
+            img = (img + 1.0) * 0.5
+        elif img_max > 2.0:
+            img = img / 255.0
+    return img.clamp(0.0, 1.0)
+
+
+def _image_frames_from_tensor(tensor: torch.Tensor, max_frames: int) -> list[torch.Tensor]:
+    """Convert supported image-like tensors into a list of CHW tensors.
+
+    Supported shapes include [B,T,C,H,W], [B,T,H,W,C], [B,C,H,W],
+    [T,C,H,W], [C,H,W], [H,W,C], and [H,W]. Tensors whose image
+    channel dimension is not 1/3/4 are rejected to avoid saving latent
+    features such as [512,1,1].
+    """
+    if not torch.is_tensor(tensor):
+        return []
+    shape = list(tensor.shape)
+    frames: list[torch.Tensor] = []
+
+    if tensor.ndim == 5:
+        # [B,T,C,H,W]
+        if _is_image_channel_count(shape[2]):
+            n = min(max_frames, shape[1])
+            frames = [tensor[0, idx] for idx in range(n)]
+        # FastAvatar commonly returns [B,T,H,W,C].
+        elif _is_image_channel_count(shape[-1]):
+            n = min(max_frames, shape[1])
+            frames = [tensor[0, idx].permute(2, 0, 1) for idx in range(n)]
+        else:
+            return []
+    elif tensor.ndim == 4:
+        # [N,C,H,W], where N may be batch or time.
+        if _is_image_channel_count(shape[1]):
+            n = min(max_frames, shape[0])
+            frames = [tensor[idx] for idx in range(n)]
+        # [N,H,W,C]
+        elif _is_image_channel_count(shape[-1]):
+            n = min(max_frames, shape[0])
+            frames = [tensor[idx].permute(2, 0, 1) for idx in range(n)]
+        else:
+            return []
+    elif tensor.ndim == 3:
+        # [C,H,W]
+        if _is_image_channel_count(shape[0]):
+            frames = [tensor]
+        # [H,W,C]
+        elif _is_image_channel_count(shape[-1]):
+            frames = [tensor.permute(2, 0, 1)]
+        else:
+            return []
+    elif tensor.ndim == 2:
+        frames = [tensor.unsqueeze(0)]
+    else:
+        return []
+
+    return [_normalize_image_tensor(frame) for frame in frames if frame.ndim == 3 and _is_image_channel_count(frame.shape[0])]
+
+
+def _iter_key_matches(obj: Any, target_key: str, path: str = "outputs"):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child_path = f"{path}.{key}"
+            if key == target_key:
+                yield child_path, value
+            yield from _iter_key_matches(value, target_key, child_path)
+    elif isinstance(obj, (list, tuple)):
+        for idx, value in enumerate(obj):
+            yield from _iter_key_matches(value, target_key, f"{path}[{idx}]")
+
+
+def find_first_image_tensor(outputs: Any, max_frames: int) -> tuple[str, list[torch.Tensor]] | None:
+    for key in IMAGE_KEY_PRIORITY:
+        for path, value in _iter_key_matches(outputs, key):
+            frames = _image_frames_from_tensor(value, max_frames=max_frames)
+            if frames:
+                return path, frames
+            if torch.is_tensor(value):
+                print(
+                    f"[P9.2ABC-EVAL][WARN] Skip non-image tensor at {path}: "
+                    f"shape={list(value.shape)} dtype={value.dtype}"
+                )
+    return None
+
+
 def save_render_images(outputs: dict[str, Any], out_dir: Path, prefix: str, max_frames: int = 4) -> list[str]:
-    saved = []
-    comp = outputs.get("comp_rgb")
-    if not torch.is_tensor(comp):
+    saved: list[str] = []
+    found = find_first_image_tensor(outputs, max_frames=max_frames)
+    if found is None:
+        print("[P9.2ABC-EVAL][WARN] No valid image-like output tensor found; skip image saving.")
         return saved
+
+    image_path, frames = found
     from torchvision.utils import save_image
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    comp_cpu = comp.detach().float().cpu().clamp(0, 1)
-    # Expected [B, N, H, W, C].
-    if comp_cpu.ndim != 5:
-        print(f"[P9.2ABC-EVAL][WARN] comp_rgb has unexpected shape {list(comp_cpu.shape)}; skip image save")
-        return saved
-    n_frames = min(max_frames, comp_cpu.shape[1])
-    for idx in range(n_frames):
-        img = comp_cpu[0, idx].permute(2, 0, 1)
+    print(f"[P9.2ABC-EVAL] Saving images from {image_path}; frames={len(frames)}")
+    for idx, img in enumerate(frames[:max_frames]):
         path = out_dir / f"{prefix}_{idx:03d}.png"
         save_image(img, path)
         saved.append(str(path))
@@ -402,8 +539,10 @@ def main() -> None:
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/mmhead_debug/p9_2_abc_eval"))
     parser.add_argument("--split", choices=("val", "train"), default="val")
     parser.add_argument("--batch_index", type=int, default=0)
-    parser.add_argument("--save_images", action="store_true", default=True)
+    parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
+    parser.add_argument("--no_save_images", dest="save_images", action="store_false")
     parser.add_argument("--max_save_frames", type=int, default=4)
+    parser.add_argument("--debug_output_shapes", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -451,6 +590,8 @@ def main() -> None:
         model, adapter_loaded = load_model_for_variant(variant_cfg, adapter_ckpt, device)
         with torch.no_grad():
             outputs, losses = forward_and_loss(model, variant_cfg, batch, device)
+        if args.debug_output_shapes or os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1":
+            print_output_debug_shapes(outputs, prefix=f"outputs.{name}")
         images = save_render_images(outputs, image_dir, name.split("_", 1)[0], max_frames=args.max_save_frames) if args.save_images else []
         results[name] = {
             "config": {
