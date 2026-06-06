@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -461,6 +463,121 @@ def save_render_images(outputs: dict[str, Any], out_dir: Path, prefix: str, max_
     return saved
 
 
+def first_image_frame_from_outputs(outputs: Any) -> torch.Tensor | None:
+    found = find_first_image_tensor(outputs, max_frames=1)
+    if found is None:
+        return None
+    _, frames = found
+    return frames[0] if frames else None
+
+
+def save_variant_grid(frames_by_variant: dict[str, torch.Tensor], path: Path) -> str | None:
+    if not frames_by_variant:
+        return None
+    from torchvision.utils import make_grid, save_image
+
+    ordered = [name for name in ("A_normal_no_token", "B_zero_no_token", "C_zero_gt_token") if name in frames_by_variant]
+    if not ordered:
+        return None
+    tensors = [frames_by_variant[name] for name in ordered]
+    # All tensors should be CHW with image channels; resize is intentionally not
+    # performed here because A/B/C use the same batch/config and should match.
+    try:
+        grid = make_grid(torch.stack(tensors, dim=0), nrow=len(tensors))
+    except Exception as exc:
+        print(f"[P9.2ABC-EVAL][WARN] Could not build image grid {path}: {exc}")
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_image(grid, path)
+    return str(path)
+
+
+def mean_std(values: list[float]) -> dict[str, float | None]:
+    finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not finite:
+        return {"mean": None, "std": None}
+    mean = sum(finite) / len(finite)
+    if len(finite) == 1:
+        std = 0.0
+    else:
+        std = (sum((v - mean) ** 2 for v in finite) / len(finite)) ** 0.5
+    return {"mean": mean, "std": std}
+
+
+def fmt_float(value: float | None, digits: int = 6) -> str:
+    return "N/A" if value is None else f"{value:.{digits}f}"
+
+
+def compute_aggregate(per_batch_results: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    variants = ["A_normal_no_token", "B_zero_no_token", "C_zero_gt_token"]
+    aggregate: dict[str, Any] = {"variants": {}, "improvement": {}}
+    for variant in variants:
+        losses = [rows.get(variant, {}).get("losses", {}) for rows in per_batch_results.values()]
+        aggregate["variants"][variant] = {
+            "total_loss": mean_std([loss.get("total_loss") for loss in losses]),
+            "r_pixel": mean_std([loss.get("r_pixel") for loss in losses]),
+        }
+
+    abs_improvements = []
+    rel_improvements = []
+    c_lt_b_count = 0
+    compared = 0
+    for rows in per_batch_results.values():
+        b = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
+        c = rows.get("C_zero_gt_token", {}).get("losses", {}).get("r_pixel")
+        if b is None or c is None:
+            continue
+        b = float(b)
+        c = float(c)
+        improvement = b - c
+        abs_improvements.append(improvement)
+        if b != 0.0:
+            rel_improvements.append(improvement / b)
+        c_lt_b_count += int(c < b)
+        compared += 1
+    aggregate["improvement"] = {
+        "b_minus_c_r_pixel": mean_std(abs_improvements),
+        "relative_b_minus_c_over_b": mean_std(rel_improvements),
+        "percent_batches_c_lt_b": None if compared == 0 else c_lt_b_count / compared,
+        "num_compared_batches": compared,
+    }
+    return aggregate
+
+
+def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir: Path) -> Path:
+    path = output_dir / "per_batch_metrics.csv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "batch_idx",
+        "variant",
+        "total_loss",
+        "r_pixel",
+        "r_perceptual",
+        "r_ssim",
+        "r_id",
+        "adapter_loaded",
+        "images",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for batch_idx in sorted(per_batch_results):
+            for variant, row in per_batch_results[batch_idx].items():
+                losses = row.get("losses", {})
+                writer.writerow({
+                    "batch_idx": batch_idx,
+                    "variant": variant,
+                    "total_loss": losses.get("total_loss"),
+                    "r_pixel": losses.get("r_pixel"),
+                    "r_perceptual": losses.get("r_perceptual"),
+                    "r_ssim": losses.get("r_ssim"),
+                    "r_id": losses.get("r_id"),
+                    "adapter_loaded": row.get("adapter_loaded", False),
+                    "images": ";".join(row.get("images", [])),
+                })
+    return path
+
+
 def json_safe(obj: Any) -> Any:
     if isinstance(obj, Path):
         return str(obj)
@@ -477,57 +594,81 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metrics.json").write_text(json.dumps(json_safe(metrics), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    results = metrics["results"]
-    a = results.get("A_normal_no_token", {}).get("losses", {})
-    b = results.get("B_zero_no_token", {}).get("losses", {})
-    c = results.get("C_zero_gt_token", {}).get("losses", {})
-    b_pixel = b.get("r_pixel")
-    c_pixel = c.get("r_pixel")
-    a_pixel = a.get("r_pixel")
-    improvement = None if b_pixel is None or c_pixel is None else b_pixel - c_pixel
-    rel = None if improvement is None or not b_pixel else improvement / b_pixel
-    c_lt_b = c_pixel is not None and b_pixel is not None and c_pixel < b_pixel
-    c_close_a = c_pixel is not None and a_pixel is not None and abs(c_pixel - a_pixel) <= max(0.02, abs(a_pixel) * 0.2)
+    aggregate = metrics.get("aggregate", {})
+    per_batch_results = metrics.get("per_batch_results", {})
+    variant_configs = metrics.get("variant_configs", {})
+    improvement = aggregate.get("improvement", {})
+    c_lt_b_pct = improvement.get("percent_batches_c_lt_b")
+    b_minus_c = improvement.get("b_minus_c_r_pixel", {})
+    rel = improvement.get("relative_b_minus_c_over_b", {})
 
     lines = [
         "# P9.2 Same-Batch A/B/C Evaluation",
+        "",
+        "## Run Selection",
+        f"* split: `{metrics.get('split')}`",
+        f"* batch_idx start: `{metrics.get('batch_idx')}`",
+        f"* requested num_batches: `{metrics.get('num_batches')}`",
+        f"* evaluated batch indices: `{metrics.get('evaluated_batch_indices')}`",
         "",
         "## Configs",
         "| Variant | use_motion_token | zero_flame_motion | motion_token_source | adapter_loaded |",
         "|---|---:|---:|---|---:|",
     ]
-    for name, row in results.items():
-        cfg = row["config"]
+    for name, cfg in variant_configs.items():
         lines.append(
-            f"| {name} | {cfg['use_motion_token']} | {cfg['zero_flame_motion']} | "
-            f"{cfg['motion_token_source']} | {row.get('adapter_loaded', False)} |"
+            f"| {name} | {cfg.get('use_motion_token')} | {cfg.get('zero_flame_motion')} | "
+            f"{cfg.get('motion_token_source')} | {cfg.get('adapter_loaded', False)} |"
         )
+
     lines += [
         "",
-        "## Losses",
-        "| Variant | total_loss | r_pixel | r_perceptual | r_ssim | r_id |",
-        "|---|---:|---:|---:|---:|---:|",
+        "## Aggregate Losses",
+        "| Variant | total_loss mean | total_loss std | r_pixel mean | r_pixel std |",
+        "|---|---:|---:|---:|---:|",
     ]
-    for name, row in results.items():
-        losses = row["losses"]
-        def fmt(k: str) -> str:
-            v = losses.get(k)
-            return "N/A" if v is None else f"{v:.6f}"
-        lines.append(f"| {name} | {fmt('total_loss')} | {fmt('r_pixel')} | {fmt('r_perceptual')} | {fmt('r_ssim')} | {fmt('r_id')} |")
+    for name, stats in aggregate.get("variants", {}).items():
+        total = stats.get("total_loss", {})
+        pixel = stats.get("r_pixel", {})
+        lines.append(
+            f"| {name} | {fmt_float(total.get('mean'))} | {fmt_float(total.get('std'))} | "
+            f"{fmt_float(pixel.get('mean'))} | {fmt_float(pixel.get('std'))} |"
+        )
+
     lines += [
         "",
         "## Relative Improvement",
-        f"* B - C r_pixel: {'N/A' if improvement is None else f'{improvement:.6f}'}",
-        f"* (B - C) / B: {'N/A' if rel is None else f'{rel:.2%}'}",
+        f"* B - C r_pixel mean/std: {fmt_float(b_minus_c.get('mean'))} / {fmt_float(b_minus_c.get('std'))}",
+        f"* (B - C) / B mean/std: {fmt_float(rel.get('mean'), 4)} / {fmt_float(rel.get('std'), 4)}",
+        f"* Percentage of batches where C < B: {'N/A' if c_lt_b_pct is None else f'{c_lt_b_pct:.2%}'}",
+        "",
+        "## Per-Batch Losses",
+        "| batch_idx | A r_pixel | B r_pixel | C r_pixel | B-C | (B-C)/B | C < B |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for batch_idx in sorted(int(k) for k in per_batch_results.keys()):
+        rows = per_batch_results[batch_idx]
+        a = rows.get("A_normal_no_token", {}).get("losses", {}).get("r_pixel")
+        b = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
+        c = rows.get("C_zero_gt_token", {}).get("losses", {}).get("r_pixel")
+        diff = None if b is None or c is None else b - c
+        rel_diff = None if diff is None or not b else diff / b
+        c_lt_b = c is not None and b is not None and c < b
+        lines.append(
+            f"| {batch_idx} | {fmt_float(a)} | {fmt_float(b)} | {fmt_float(c)} | "
+            f"{fmt_float(diff)} | {fmt_float(rel_diff, 4)} | {c_lt_b} |"
+        )
+
+    lines += [
         "",
         "## Conclusion",
-        f"* C < B: {c_lt_b}",
-        f"* C close to A (heuristic): {c_close_a}",
     ]
-    if c_lt_b:
-        lines.append("* Interpretation: the GT motion token improves over zeroed FLAME without a token on the exact same batch.")
+    if c_lt_b_pct is None:
+        lines.append("* No comparable B/C r_pixel batches were evaluated.")
+    elif c_lt_b_pct > 0.5:
+        lines.append("* C improves over B on most evaluated batches, suggesting the GT motion token helps under zeroed FLAME motion.")
     else:
-        lines.append("* Interpretation: the GT motion token did not improve over zeroed FLAME on this batch; inspect images and debug logs.")
+        lines.append("* C does not improve over B on most evaluated batches; this may indicate adapter overfit to a different batch or weak token conditioning.")
     (output_dir / "comparison_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -538,7 +679,8 @@ def main() -> None:
     parser.add_argument("--adapter_ckpt", type=Path, default=Path("exps/checkpoints/fastavatar/fastavatar_motion_zero_token_overfit_micro_render_20step/000020/model.safetensors"))
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/mmhead_debug/p9_2_abc_eval"))
     parser.add_argument("--split", choices=("val", "train"), default="val")
-    parser.add_argument("--batch_index", type=int, default=0)
+    parser.add_argument("--batch_idx", "--batch_index", dest="batch_idx", type=int, default=0)
+    parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
     parser.add_argument("--no_save_images", dest="save_images", action="store_false")
     parser.add_argument("--max_save_frames", type=int, default=4)
@@ -572,41 +714,81 @@ def main() -> None:
     if len(loader.dataset) == 0:
         raise RuntimeError("No samples available for same-batch evaluation")
 
-    batch = None
+    selected_batches: list[tuple[int, dict[str, Any]]] = []
+    stop_after = args.batch_idx + args.num_batches
     for idx, item in enumerate(loader):
-        if idx == args.batch_index:
-            batch = item
+        if idx < args.batch_idx:
+            continue
+        if idx >= stop_after:
             break
-    if batch is None:
-        raise RuntimeError(f"Could not fetch batch_index={args.batch_index}; dataset size={len(loader.dataset)}")
-    batch = move_to_device(batch, device)
-    batch_summary = flame_motion_summary(batch)
+        selected_batches.append((idx, item))
+    if not selected_batches:
+        raise RuntimeError(
+            f"Could not fetch any batches for batch_idx={args.batch_idx}, "
+            f"num_batches={args.num_batches}; dataset size={len(loader.dataset)}"
+        )
 
-    results: dict[str, Any] = {}
+    output_dir.mkdir(parents=True, exist_ok=True)
     image_dir = output_dir / "images"
+    grid_dir = output_dir / "image_grids"
     variants = ["A_normal_no_token", "B_zero_no_token", "C_zero_gt_token"]
+    per_batch_results: dict[int, dict[str, Any]] = {idx: {} for idx, _ in selected_batches}
+    batch_motion_summaries: dict[int, dict[str, Any]] = {}
+    grid_frames_by_batch: dict[int, dict[str, torch.Tensor]] = {idx: {} for idx, _ in selected_batches}
+    variant_configs: dict[str, Any] = {}
+
     for name in variants:
         variant_cfg = make_variant_config(cfg, name, adapter_ckpt if adapter_ckpt and adapter_ckpt.exists() else None)
         model, adapter_loaded = load_model_for_variant(variant_cfg, adapter_ckpt, device)
-        with torch.no_grad():
-            outputs, losses = forward_and_loss(model, variant_cfg, batch, device)
-        if args.debug_output_shapes or os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1":
-            print_output_debug_shapes(outputs, prefix=f"outputs.{name}")
-        images = save_render_images(outputs, image_dir, name.split("_", 1)[0], max_frames=args.max_save_frames) if args.save_images else []
-        results[name] = {
-            "config": {
-                "use_motion_token": bool(variant_cfg.model.use_motion_token),
-                "zero_flame_motion": bool(variant_cfg.model.zero_flame_motion),
-                "motion_token_source": str(variant_cfg.model.motion_token_source),
-            },
+        variant_configs[name] = {
+            "use_motion_token": bool(variant_cfg.model.use_motion_token),
+            "zero_flame_motion": bool(variant_cfg.model.zero_flame_motion),
+            "motion_token_source": str(variant_cfg.model.motion_token_source),
             "adapter_loaded": adapter_loaded,
-            "losses": losses,
-            "images": images,
         }
-        print(f"[P9.2ABC-EVAL] {name}: losses={losses} adapter_loaded={adapter_loaded} images={images}")
-        del model, outputs
+        for batch_idx, batch_cpu in selected_batches:
+            batch = move_to_device(batch_cpu, device)
+            if batch_idx not in batch_motion_summaries:
+                batch_motion_summaries[batch_idx] = flame_motion_summary(batch)
+            with torch.no_grad():
+                outputs, losses = forward_and_loss(model, variant_cfg, batch, device)
+            if args.debug_output_shapes or os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1":
+                print_output_debug_shapes(outputs, prefix=f"outputs.{name}.batch{batch_idx}")
+            images: list[str] = []
+            if args.save_images:
+                images = save_render_images(
+                    outputs,
+                    image_dir,
+                    f"{name.split('_', 1)[0]}_batch{batch_idx:04d}",
+                    max_frames=args.max_save_frames,
+                )
+                first_frame = first_image_frame_from_outputs(outputs)
+                if first_frame is not None:
+                    grid_frames_by_batch[batch_idx][name] = first_frame
+            per_batch_results[batch_idx][name] = {
+                "config": variant_configs[name],
+                "adapter_loaded": adapter_loaded,
+                "losses": losses,
+                "images": images,
+            }
+            print(
+                f"[P9.2ABC-EVAL] batch={batch_idx} {name}: "
+                f"losses={losses} adapter_loaded={adapter_loaded} images={images}"
+            )
+            del outputs, batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    image_grids: dict[int, str | None] = {}
+    if args.save_images:
+        for batch_idx, frames in grid_frames_by_batch.items():
+            image_grids[batch_idx] = save_variant_grid(frames, grid_dir / f"batch{batch_idx:04d}_ABC.png")
+
+    aggregate = compute_aggregate(per_batch_results)
+    csv_path = write_per_batch_csv(per_batch_results, output_dir)
 
     metrics = {
         "base_config": base_config,
@@ -615,14 +797,21 @@ def main() -> None:
         "selected_ids": selected_ids,
         "val_id": val_id,
         "split": args.split,
-        "batch_index": args.batch_index,
+        "batch_idx": args.batch_idx,
+        "num_batches": args.num_batches,
+        "evaluated_batch_indices": [idx for idx, _ in selected_batches],
         "adapter_ckpt": adapter_ckpt,
         "adapter_ckpt_exists": bool(adapter_ckpt and adapter_ckpt.exists()),
-        "batch_motion_summary": batch_summary,
-        "results": results,
+        "batch_motion_summaries": batch_motion_summaries,
+        "variant_configs": variant_configs,
+        "per_batch_results": per_batch_results,
+        "aggregate": aggregate,
+        "per_batch_csv": csv_path,
+        "image_grids": image_grids,
     }
     write_report(metrics, output_dir)
     print(f"[P9.2ABC-EVAL] wrote metrics: {output_dir / 'metrics.json'}")
+    print(f"[P9.2ABC-EVAL] wrote per-batch CSV: {csv_path}")
     print(f"[P9.2ABC-EVAL] wrote report: {output_dir / 'comparison_report.md'}")
 
 
