@@ -123,6 +123,7 @@ train:
 val:
     batch_size: 1
     global_step_period: 999999
+    skip_eval: true
     debug_batches: null
     save_images: false
     save_dir: "./exps/val_perf"

@@ -398,7 +398,10 @@ class FastAvatarTrainer(Trainer):
                 if self.global_step % self.cfg.saver.checkpoint_global_steps == 0:
                     self.save_checkpoint()
                 if self.global_step % self.cfg.val.global_step_period == 0:
-                    self.evaluate()
+                    if getattr(self.cfg.val, 'skip_eval', False):
+                        logger.info("Skip evaluation because val.skip_eval=true")
+                    else:
+                        self.evaluate()
                     self.model.train()
                 
                 del data
@@ -469,7 +472,10 @@ class FastAvatarTrainer(Trainer):
 
             # final checkpoint and evaluation
             self.save_checkpoint()
-            self.evaluate()
+            if getattr(self.cfg.val, 'skip_eval', False):
+                logger.info("Skip evaluation because val.skip_eval=true")
+            else:
+                self.evaluate()
     
     @torch.no_grad()
     @torch.compiler.disable
@@ -512,6 +518,12 @@ class FastAvatarTrainer(Trainer):
             running_losses.append(loss_tensor)
             batch_idx += 1
         
+        if not running_losses:
+            logger.warning("No validation batches were evaluated; skip loss aggregation.")
+            self.model.train()
+            clear_memory()
+            return {}
+
         total_losses = self.accelerator.gather(torch.stack(running_losses)).mean(dim=0).cpu()
         total_vals = total_losses.unbind()
         
