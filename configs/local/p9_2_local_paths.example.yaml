@@ -1,0 +1,6 @@
+# Copy this file to configs/local/p9_2_local_paths.yaml and edit for your machine.
+# The local file is gitignored and takes precedence over base config defaults.
+nersemble_root_dir: "/ssd_data/sjd/data/nersemble_fastavatar_unified_full"
+source_mixed_uids: "/home/sjd/FastAvatar_mmhead/datasets/mixed_uids.json"
+generated_meta_path: "./datasets/p9_2_overfit_mixed_uids.json"
+preferred_val_id: null
