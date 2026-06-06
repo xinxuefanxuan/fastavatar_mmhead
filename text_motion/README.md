@@ -72,3 +72,709 @@ python text_motion/run_text_to_motion.py \
 - `motion_primitives.py`：时序曲线 + 原语实现
 - `run_text_to_motion.py`：主入口
 - `primitives.yaml`：受控 prompt 映射与参数
+
+## 7) 检索式 Text-to-MMHead 代码本（第一版）
+
+第一版目标：给定文本 prompt，从 MMHead 样本中做关键词检索，选出 top-k（默认取 top-1），再复用 `run_mmhead_to_motion.py` 完成 FastAvatar 可读 motion 序列生成。
+
+### 数据假设
+
+MMHead 根目录下可包含：
+
+- `t2m_manifest.jsonl`
+- `facial_motion/{sample_id}.pkl`（主格式）
+- `facial_motion/{sample_id}.npz`（可选 fallback）
+- `text_annotations/action/{sample_id}.txt`
+- `text_annotations/detail_expression/{sample_id}.txt`
+- `text_annotations/detail_head_pose/{sample_id}.txt`
+- `text_annotations/emotion/{sample_id}.txt`
+- `text_annotations/emotion_scenario/{sample_id}.txt`
+
+### 7.1 构建 codebook
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl outputs/codebook.jsonl
+```
+
+可选调试：
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl outputs/codebook_debug.jsonl \
+  --max_samples 20 \
+  --verbose
+```
+
+### 7.2 检查 codebook
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+p=Path('outputs/codebook.jsonl')
+for i,l in enumerate(p.open('r',encoding='utf-8')):
+    if i>=3: break
+    print(json.loads(l))
+PY
+```
+
+### 7.3 关键词检索 top-k
+
+```bash
+python text_motion/mmhead_retrieval.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook_debug.jsonl \
+  --top_k 5 \
+  --output_jsonl outputs/retrieval_debug.jsonl
+```
+
+### 7.4 文本到 FastAvatar motion（检索+转换）
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook_debug.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion_debug \
+  --top_k 5 \
+  --rank_index 0 \
+  --dry_run
+```
+
+支持保存检索结果与元数据：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion \
+  --top_k 10 \
+  --rank_index 0 \
+  --save_retrieval_jsonl assets/sample_motion/text_retrieved_motion/retrieval_topk.jsonl \
+  --save_metadata_json assets/sample_motion/text_retrieved_motion/retrieval_meta.json
+```
+
+### 7.5 用 infer.sh 渲染
+
+检索转换完成后，沿用你已有推理入口：
+
+```bash
+bash scripts/infer/infer.sh \
+  configs/inference/infer.yaml \
+  model_zoo/fastavatar/ \
+  assets/sample_input/mono_video/nersemble_seq_214.mp4 \
+  assets/sample_motion/text_retrieved_motion/
+```
+
+### 7.6 输出验证建议
+
+- `codebook.jsonl` 每行一个样本，包含 `searchable_text`、`annotations`、`motion_stats`。
+- `retrieval_topk.jsonl` 包含排序、匹配词、分数分解。
+- `retrieval_meta.json` 记录 prompt、选中样本、命令行参数和时间戳。
+- `output_motion` 目录结构应保持与模板兼容（含 `transforms.json` 与 `flame_param/*.npz`）。
+
+### 7.7 已知限制（第一版）
+
+- 仅关键词检索（无 embedding、无 FAISS）。
+- 无聚类/码本压缩（每个样本即一个 codebook entry）。
+- 运动方向统计是粗粒度（基于 delta norm）。
+- 文本匹配不保证视觉上完全一致，仅提供可解释、可复现的第一版检索基线。
+
+### 7.8 头部抖动稳定化建议（MMHead native posecodes）
+
+如果检索到的样本在 `head_pose` 上出现抖动，可在转换时启用平滑与速度钳制：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl outputs/codebook.jsonl \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/text_retrieved_motion_stable \
+  --top_k 10 \
+  --rank_index 0 \
+  --head_smooth_window 9 \
+  --head_max_step 0.03 \
+  --head_scale 0.05
+```
+
+说明：
+- `*_smooth_window > 1` 时，按时间维做中心滑动平均（边界用 edge padding）。
+- `head_max_step > 0` 时，会对帧间头部步长做范数钳制并重建轨迹。
+- 默认参数（window=1, max_step=0）保持旧行为不变。
+
+## 8) 构建中性静态模板（neutral template）
+
+当你希望“文本检索动作”不叠加原模板动态，而是从静态中性状态出发时，可先构建 neutral 模板：
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --reference_frame 0
+```
+
+或自动选择最中性帧：
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --auto_neutral
+```
+
+自动中性评分（使用可用键）：
+
+- `score = ||expr||_2 + ||jaw_pose||_2 + 0.3 * ||rotation||_2`
+
+脚本行为：
+- 先完整复制模板目录到输出目录；
+- 遍历 `flame_param/*.npz`；
+- 将每帧 `expr/jaw_pose/rotation/translation/eyes_pose/shape`（若存在）替换为参考帧值；
+- 保留 `canonical_flame_param.npz`、`transforms*.json`、`processed_data/` 以及其他文件不变。
+
+随后可将 neutral 模板用于检索驱动：
+
+```bash
+python text_motion/run_text_to_mmhead_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_neutral_turn_left_smile \
+  --top_k 10 \
+  --rank_index 0 \
+  --mode all \
+  --num_frames 90 \
+  --expr_scale 0.12 \
+  --head_scale 0.05 \
+  --jaw_scale 0.2 \
+  --head_smooth_window 9 \
+  --jaw_smooth_window 3 \
+  --head_max_step 0.03
+```
+
+## 9) Channel-disentangled retrieval and composition
+
+动机：holistic 检索会把 head/expression/jaw 耦合迁移，容易出现语义混合。该流程按通道检索并在 neutral 模板上组合，控制更干净。
+
+### 9.1 刷新 codebook
+
+```bash
+python text_motion/mmhead_codebook.py \
+  --mmhead_root /path/to/MMHead \
+  --manifest /path/to/MMHead/t2m_manifest.jsonl \
+  --output_jsonl "$OUT_DIR/codebook_full.jsonl"
+```
+
+### 9.2 先构建 neutral 模板
+
+```bash
+python text_motion/make_neutral_template.py \
+  --template_motion assets/sample_motion/nersemble_seq_214 \
+  --output_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --auto_neutral
+```
+
+### 9.3 通道组合生成动作
+
+```bash
+python text_motion/run_text_to_composed_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_composed_turn_left_smile \
+  --top_k 10 \
+  --head_scale 0.15 \
+  --expr_scale 0.12 \
+  --jaw_scale 0.2 \
+  --head_smooth_window 9 \
+  --head_max_step 0.03 \
+  --head_target_field neck_pose
+```
+
+### 9.4 推理
+
+```bash
+bash scripts/infer/infer.sh \
+  configs/inference/infer.yaml \
+  model_zoo/fastavatar/ \
+  assets/sample_input/mono_video/nersemble_seq_214.mp4 \
+  assets/sample_motion/text_composed_turn_left_smile/ \
+  16 \
+  16 \
+  Monocular \
+  false
+```
+
+注意：传给 `infer.sh` 的 motion 目录建议带 trailing slash（`.../`）。
+
+## Direction calibration and head-axis controls
+
+When composed head motion direction looks inverted (e.g. prompt asks "left" but render looks "right"), use head axis controls in composed generation:
+
+```bash
+python text_motion/run_text_to_composed_motion.py \
+  --prompt "turn head left and smile" \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion assets/sample_motion/text_composed_turn_left_smile \
+  --top_k 10 \
+  --head_target_field neck_pose \
+  --head_axis_order 0,1,2 \
+  --head_axis_signs 1,-1,1
+```
+
+`--head_axis_order` reorders MMHead head channels before writing to FastAvatar head target field, and `--head_axis_signs` applies per-axis sign flips.
+
+To manually calibrate which `neck_pose` axis/sign corresponds to viewer-left/viewer-right, generate six calibration motions:
+
+```bash
+python text_motion/calibrate_neck_axes.py \
+  --template_motion assets/sample_motion/nersemble_seq_214_neutral \
+  --output_root assets/sample_motion/neck_axis_calib \
+  --num_frames 16 \
+  --amplitude 0.2
+```
+
+This creates:
+- `axis0_pos`, `axis0_neg`
+- `axis1_pos`, `axis1_neg`
+- `axis2_pos`, `axis2_neg`
+
+Render each folder and map axis/sign to your desired visual direction.
+
+## P2.1: 构建训练用规范化运动数据集
+
+用于下一阶段 motion AE/VAE 训练的数据导出（不包含模型训练）。
+
+### 构建数据集
+
+```bash
+python text_motion/build_motion_dataset.py \
+  --codebook_jsonl "$OUT_DIR/codebook_full.jsonl" \
+  --output_root outputs/motion_dataset_v1 \
+  --target_len 90 \
+  --min_frames 32 \
+  --ref_n 5 \
+  --head_axis_signs 1,-1,1
+```
+
+脚本会：
+- 读取 codebook；
+- 按 native MMHead pkl 提取 `expcodes/posecodes`；
+- 构建 `expr/head/jaw` 的 delta 序列；
+- 对 `head` 应用 `--head_axis_signs`；
+- 统一到 `target_len`；
+- 输出 `motions/*.npz` + `manifest.jsonl/train.jsonl/val.jsonl`。
+
+### 检查数据集
+
+```bash
+python text_motion/inspect_motion_dataset.py \
+  --dataset_root outputs/motion_dataset_v1
+```
+
+输出包括：样本数、train/val 数、motion shape、expr/head/jaw 的 norm 统计与示例条目。
+
+## P2.2: 将导出的 motion npz 回写为 FastAvatar 动作目录
+
+将 `build_motion_dataset.py` 导出的单个样本（如 `[T,56]`）写回 neutral 模板，生成可直接用于 FastAvatar 推理的 motion 目录。
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion_root outputs/mmhead_debug/render_npz_test_fixed \
+  --sequence_name EXAMPLE_ID \
+  --motion_key motion \
+  --head_target neck_pose \
+  --smooth \
+  --head_velocity_clamp 0.03 \
+  --overwrite
+```
+
+默认通道布局：
+- `motion[:, 0:50] -> expr_delta`
+- `motion[:, 50:53] -> head_delta`
+- `motion[:, 53:56] -> jaw_delta`
+
+并分别写入：
+- `expr_delta -> expr`
+- `head_delta -> neck_pose`（可切换到 `rotation`）
+- `jaw_delta -> jaw_pose`
+
+推荐用于 FastAvatar 的目录布局（`--output_motion_root`）：
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/mmhead_debug/motion_dataset_v1_debug/motions/CELEBVHQ_01ClRWyf9I4_0.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --output_motion_root outputs/mmhead_debug/render_npz_test_fixed \
+  --sequence_name CELEBVHQ_01ClRWyf9I4_0 \
+  --motion_key motion \
+  --head_target neck_pose \
+  --overwrite
+```
+
+FastAvatar pack 模式（直接得到 `pack_root/sequence_name` 作为 infer motion 参数）：
+
+```bash
+python text_motion/render_motion_npz.py \
+  --motion_npz outputs/mmhead_debug/motion_dataset_v1_debug/motions/CELEBVHQ_01ClRWyf9I4_0.npz \
+  --neutral_template assets/sample_motion/nersemble_seq_214_neutral \
+  --fastavatar_pack \
+  --pack_root outputs/mmhead_debug/render_npz_pack \
+  --sequence_name CELEBVHQ_01ClRWyf9I4_0 \
+  --motion_key motion \
+  --head_target neck_pose \
+  --overwrite
+```
+
+说明：`--fastavatar_pack` 会同时创建 root-level symlink，确保兼容 FastAvatar 的实际读取路径：  
+`pack_root/flame_param -> pack_root/sequence_name/flame_param`，  
+`pack_root/processed_data -> pack_root/sequence_name/processed_data`。  
+注意：pack 模式下 `sequence_name/flame_param` 必须是**真实目录**（脚本会复制模板帧并写入编辑后的 npz），绝不能把它 symlink 到 neutral template 的 `flame_param`，否则会污染模板。  
+最终布局（FastAvatar 兼容）：
+- `pack_root/canonical_flame_param.npz`
+- `pack_root/transforms*.json`
+- `pack_root/flame_param -> sequence_name/flame_param`（相对 symlink）
+- `pack_root/processed_data -> sequence_name/processed_data`（相对 symlink）
+- `pack_root/sequence_name/flame_param/*.npz`（真实目录，写入编辑后动作）
+- `pack_root/sequence_name/processed_data`（可为到模板的 symlink）
+
+## P3.1 Motion Autoencoder（非VAE）
+
+先确保 P2.1 数据集已包含：
+- `motion_raw`（未归一化 56 维）
+- `motion_norm`（按 `norm_stats.json` 逐维归一化）
+
+### 训练 AE
+
+```bash
+python motion_model/train_motion_ae.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_dir outputs/motion_ae_v1 \
+  --latent_dim 64 \
+  --epochs 30 \
+  --batch_size 64
+```
+
+损失为加权重建：
+- expr: 1
+- head: 10
+- jaw: 10
+
+### 重建单个样本
+
+```bash
+python motion_model/reconstruct_motion_ae.py \
+  --input_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --checkpoint outputs/motion_ae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_ae_v1/recon_EXAMPLE_ID.npz
+```
+
+输出 `recon_*.npz` 包含 `motion`/`motion_raw`/`motion_norm` 与 `expr_delta/head_delta/jaw_delta`，可直接配合 `text_motion/render_motion_npz.py` 渲染。
+
+## P3.2 Motion VAE（最小增量）
+
+在 P3.1 AE 基础上增加 `mu/logvar` 与重参数化，训练目标：
+
+- `L = recon_loss + beta * KL`
+- `beta` 默认 `1e-4`
+- 默认启用 KL warmup（前 20 个 epoch 线性升温）
+- recon_loss 仍使用通道加权：expr=1, head=10, jaw=10
+
+### 训练 VAE
+
+```bash
+python motion_model/train_motion_vae.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_dir outputs/motion_vae_v1 \
+  --latent_dim 64 \
+  --epochs 30 \
+  --beta 1e-4 \
+  --kl_warmup_epochs 20
+```
+
+输出：`best.pt`、`last.pt`、`train_log.json`。
+
+### 采样新动作（渲染兼容 npz）
+
+```bash
+python motion_model/sample_motion_vae.py \
+  --checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_vae_v1/sample_000.npz \
+  --num_frames 64 \
+  --z_scale 0.5 \
+  --num_samples 4 \
+  --smooth \
+  --smooth_window 5 \
+  --head_scale 1.0 \
+  --head_velocity_clamp 0.03
+```
+
+采样输出字段与 `render_motion_npz.py` 兼容：
+- `motion`
+- `motion_raw`
+- `motion_norm`
+- `expr_delta`
+- `head_delta`
+- `jaw_delta`
+
+### VAE 重建单个样本（deterministic, use mu）
+
+```bash
+python motion_model/reconstruct_motion_vae.py \
+  --input_npz outputs/motion_dataset_v1/motions/EXAMPLE_ID.npz \
+  --checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/motion_vae_v1/recon_EXAMPLE_ID_from_vae.npz \
+  --motion_key motion_norm
+```
+
+输出同样与 `render_motion_npz.py` 兼容，并打印原始/重建的 expr/head/jaw 统计。
+
+## P4.1 Primitive-label-to-latent（规则标签）
+
+当前仅做 primitive 标签到 latent 的监督映射，不做 free-form text embedding。
+
+### 1) 生成 primitive 标签
+
+```bash
+python motion_model/build_primitive_labels.py \
+  --dataset_root outputs/motion_dataset_v1 \
+  --output_root outputs/primitive_labels_v1 \
+  --yaw_threshold 0.015 \
+  --pitch_threshold 0.015 \
+  --jaw_threshold 0.01 \
+  --neutral_threshold 0.02 \
+  --max_per_label 1200 \
+  --val_ratio 0.1
+```
+
+标签集合：
+- `turn_left`
+- `turn_right`
+- `nod`
+- `smile`
+- `mouth_open`
+- `neutral`
+- `other`
+
+会输出：
+- `train_labeled.jsonl`
+- `val_labeled.jsonl`
+- `label_map.json`
+并打印标签分布。
+
+### 2) 训练 primitive -> latent 预测器
+
+```bash
+python motion_model/train_primitive_to_latent.py \
+  --labeled_root outputs/primitive_labels_v1 \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --output_dir outputs/primitive_to_latent_v1 \
+  --epochs 30 \
+  --balanced_sampler
+```
+
+说明：训练时会冻结 VAE，仅用其 encoder 的 `mu`（时序均值）作为监督目标 latent。
+
+### 3) 从 primitive 生成动作（渲染兼容 npz）
+
+```bash
+python motion_model/generate_from_primitive.py \
+  --primitive_checkpoint outputs/primitive_to_latent_v1/best.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --primitive_label turn_left \
+  --output_npz outputs/primitive_to_latent_v1/gen_turn_left.npz \
+  --num_frames 64
+```
+
+输出字段与 `render_motion_npz.py` 兼容：
+- `motion`
+- `motion_raw`
+- `motion_norm`
+- `expr_delta`
+- `head_delta`
+- `jaw_delta`
+
+## P4.2 Primitive latent prototype baseline
+
+当 primitive->latent MLP 学不到有效提升时，可先使用 prototype baseline：每个 primitive 聚合一个 latent 原型（均值/方差）。
+
+### 1) 构建 primitive latent prototypes
+
+```bash
+python motion_model/build_primitive_latent_prototypes.py \
+  --labeled_root outputs/primitive_labels_v1 \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --output_path outputs/primitive_labels_v1/prototypes.pt
+```
+
+可选：`--top_k` 用于快速调试仅前 K 条样本。
+
+### 2) 从 prototype 生成动作
+
+```bash
+python motion_model/generate_from_primitive_prototype.py \
+  --primitive turn_left \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_turn_left_proto.npz \
+  --target_len 64 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+输出 `npz` 与 `render_motion_npz.py` 兼容（`motion/motion_raw/motion_norm/expr_delta/head_delta/jaw_delta`）。
+
+## P4.3 Primitive latent composition
+
+使用 neutral 原型作为基底，按方向组合多个 primitive latent：
+
+`z = z_neutral + sum_i alpha_i * (z_primitive_i - z_neutral)`
+
+```bash
+python motion_model/generate_composed_primitive.py \
+  --primitives turn_left,smile \
+  --weights 1.0,0.8 \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_turn_left_smile_comp.npz \
+  --target_len 64 \
+  --temporal_mode hold \
+  --output_len 32 \
+  --ramp_frames 10 \
+  --hold_frames 18 \
+  --release_frames 4 \
+  --release_ratio 0.75 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+输出 `npz` 与 `render_motion_npz.py` 兼容，并打印 expr/head/jaw 统计与 head yaw 的 min/max。
+
+## P5 Rule-based text-to-primitive generation
+
+将简单自然语言 prompt 映射到 primitive + 权重，再用与 P4.3 一致的 latent 组合与解码流程生成动作。
+
+```bash
+python motion_model/generate_from_text_rule.py \
+  --prompt "turn head left with a slight smile" \
+  --prototype_path outputs/primitive_labels_v1/prototypes.pt \
+  --vae_checkpoint outputs/motion_vae_v1/best.pt \
+  --norm_stats outputs/motion_dataset_v1/norm_stats.json \
+  --output_npz outputs/primitive_labels_v1/gen_text_rule_left_smile.npz \
+  --target_len 64 \
+  --output_len 32 \
+  --temporal_mode hold \
+  --ramp_frames 10 \
+  --hold_frames 18 \
+  --release_frames 4 \
+  --release_ratio 0.75 \
+  --latent_scale 1.0 \
+  --noise_scale 0.0
+```
+
+规则映射（示例）：
+- left / turn left / look left → `turn_left`
+- right / turn right / look right → `turn_right`
+- nod / nodding → `nod`
+- smile / happy / grin → `smile`
+- open mouth / mouth open / jaw → `mouth_open`
+- neutral / still → `neutral`
+
+强度词倍率：
+- slight / subtle / a little → `0.7`
+- very → `1.3`
+- strong / big / exaggerated → `1.5`
+
+
+## P6.5 Text-to-Prototype latent baseline
+
+Train:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_text_to_prototype.py \
+  --train_manifest outputs/mmhead_debug/motion_dataset_v1_ae_debug/train.jsonl \
+  --val_manifest outputs/mmhead_debug/motion_dataset_v1_ae_debug/val.jsonl \
+  --text_embeddings_dir outputs/mmhead_debug/text_embeddings_v1 \
+  --label_jsonl outputs/mmhead_debug/primitive_labels_v2/all_labeled_normalized.jsonl \
+  --label_field label \
+  --prototype_path outputs/mmhead_debug/primitive_prototypes_v1/prototypes.pt \
+  --vae_checkpoint outputs/mmhead_debug/vae_debug_beta1e4/best.pt \
+  --norm_stats outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json \
+  --output_dir outputs/mmhead_debug/text_to_prototype_v1 \
+  --primitive_classes neutral,turn_left,turn_right,nod,smile,mouth_open \
+  --latent_dim 64 --hidden_dim 512 --num_layers 3 \
+  --batch_size 128 --epochs 100 --lr 1e-4 --device cuda \
+  --max_per_label 450 --balanced_sampler --eval_every 10
+```
+
+Generate:
+```bash
+python motion_model/generate_from_text_prototype.py \
+  --prompt "turn left and smile" \
+  --checkpoint outputs/mmhead_debug/text_to_prototype_v1/best.pt \
+  --prototype_path outputs/mmhead_debug/primitive_prototypes_v1/prototypes.pt \
+  --vae_checkpoint outputs/mmhead_debug/vae_debug_beta1e4/best.pt \
+  --norm_stats outputs/mmhead_debug/motion_dataset_v1_ae_debug/norm_stats.json \
+  --output_npz outputs/mmhead_debug/text_prototype_generated/turn_left_smile.npz \
+  --encoder_name /home/yuanyuhao/models/all-MiniLM-L6-v2 \
+  --device cuda
+```
+
+- Note: in `generate_from_text_prototype.py`, `--manual_weights_json` uses raw amplitude coefficients by default (P5-compatible). Use `--normalize_manual_weights` only for debugging experiments.
+
+## P7.1 Channel-wise VAE reconstruction
+
+Train expr channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel expr \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/expr \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Train head channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel head \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/head \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Train jaw channel VAE:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/train_channel_vae.py \
+  --channel jaw \
+  --output_dir outputs/mmhead_debug/channel_vae_v1/jaw \
+  --epochs 100 \
+  --batch_size 128 \
+  --device cuda
+```
+
+Reconstruct with three channel VAEs:
+```bash
+CUDA_VISIBLE_DEVICES=1 python motion_model/reconstruct_with_channel_vaes.py \
+  --input_npz outputs/mmhead_debug/text_prototype_multilabel_v2_generated_best/turn_left_and_smile.npz \
+  --expr_checkpoint outputs/mmhead_debug/channel_vae_v1/expr/best.pt \
+  --head_checkpoint outputs/mmhead_debug/channel_vae_v1/head/best.pt \
+  --jaw_checkpoint outputs/mmhead_debug/channel_vae_v1/jaw/best.pt \
+  --output_npz outputs/mmhead_debug/channel_vae_v1/recon/turn_left_and_smile_recon.npz \
+  --device cuda
+```
