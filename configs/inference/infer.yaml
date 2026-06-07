@@ -52,6 +52,19 @@ model:
     rendering_chunk_size_train: 16
     rendering_chunk_size_infer: 128
 
+    # P9.1 optional MotionTokenAdapter (disabled by default; preserves baseline behavior)
+    use_motion_token: false
+    motion_token_input_dim: 96
+    motion_token_hidden_dim: null
+    motion_token_mode: "add_query"
+    motion_token_scale: 1.0
+    zero_flame_motion: false
+    freeze_backbone_for_motion_token: false
+    motion_token_source: "none"
+    motion_token_norm_stats: null
+    motion_token_expr_dim: 50
+    motion_token_pad_to_dim: 96
+
 dataset:
     input_frames: 256
     target_frames: 16
