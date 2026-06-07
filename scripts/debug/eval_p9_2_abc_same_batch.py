@@ -182,6 +182,7 @@ def write_runtime_config_with_meta(
     cfg.dataset.meta_path = str(meta_path)
     cfg.dataset.datasets.nersemble.root_dir = str(root_dir)
     cfg.dataset.datasets.nersemble.val_id = list(val_ids)
+    cfg.dataset.val_num = 0
     cfg.model.debug_skip_renderer = False
     cfg.model.debug_latent_smoke_loss = False
     cfg.model.debug_max_query_points = None
@@ -987,7 +988,7 @@ def main() -> None:
     parser.add_argument("--split", choices=("val", "train", "holdout"), default="val")
     parser.add_argument("--holdout_ids", default="083", help="Comma-separated IDs for holdout train-style no-grad evaluation.")
     parser.add_argument("--train_ids", default="030,037,038,069,070", help="Comma-separated adapter-training IDs for disjointness/reporting checks.")
-    parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle"), default=None)
+    parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle", "holdout_trainstyle_no_val_exclusion"), default=None)
     parser.add_argument("--batch_idx", "--batch_index", dest="batch_idx", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
@@ -1013,16 +1014,19 @@ def main() -> None:
     if overlap:
         raise RuntimeError(f"holdout_ids must be disjoint from train_ids; overlap={overlap}")
     holdout_train_ids_disjoint = True
-    requested_protocol = args.eval_protocol or ("holdout_trainstyle" if args.split == "holdout" else "native_val")
-    if args.split == "holdout" and requested_protocol != "holdout_trainstyle":
-        raise RuntimeError("--split holdout requires --eval_protocol holdout_trainstyle or an omitted --eval_protocol")
-    if requested_protocol == "holdout_trainstyle" and args.split != "holdout":
-        raise RuntimeError("--eval_protocol holdout_trainstyle requires --split holdout")
+    requested_protocol = args.eval_protocol or ("holdout_trainstyle_no_val_exclusion" if args.split == "holdout" else "native_val")
+    if args.split == "holdout" and requested_protocol not in ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion"):
+        raise RuntimeError("--split holdout requires --eval_protocol holdout_trainstyle_no_val_exclusion or an omitted --eval_protocol")
+    if requested_protocol in ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion") and args.split != "holdout":
+        raise RuntimeError("holdout train-style eval protocols require --split holdout")
+    if requested_protocol == "holdout_trainstyle":
+        print("[P9.2ABC-EVAL][WARN] eval_protocol=holdout_trainstyle is an alias; using holdout_trainstyle_no_val_exclusion.")
+        requested_protocol = "holdout_trainstyle_no_val_exclusion"
 
     val_id_diagnostics: dict[str, dict[str, int]] = {}
     selected_ids: list[str]
     val_id = ""
-    if requested_protocol == "holdout_trainstyle":
+    if requested_protocol == "holdout_trainstyle_no_val_exclusion":
         if not holdout_ids:
             raise RuntimeError("--split holdout requires at least one --holdout_ids value")
         prefer_ids = train_ids + [uid for uid in holdout_ids if uid not in set(train_ids)]
@@ -1037,21 +1041,40 @@ def main() -> None:
             holdout_meta,
             val_ids=[],
             output_dir=output_dir,
-            suffix="holdout_trainstyle_resolved",
+            suffix="holdout_trainstyle_no_val_exclusion_resolved",
         )
         cfg = load_yaml(runtime_config)
         loader = build_loader(cfg, "train")
         actual_split = "holdout"
-        split_counts = {"holdout": len(loader.dataset), "train_style_loader": len(loader.dataset), "native_val": 0}
-        if len(loader.dataset) <= 0:
+        holdout_dataset_len = len(loader.dataset)
+        nersemble_val_id = list(cfg.dataset.datasets.nersemble.val_id)
+        val_num = int(cfg.dataset.val_num)
+        validation_exclusion_disabled = val_num == 0 and len(nersemble_val_id) == 0
+        split_counts = {"holdout": holdout_dataset_len, "train_style_loader": holdout_dataset_len, "native_val": 0}
+        if not validation_exclusion_disabled:
+            raise RuntimeError(
+                f"Holdout train-style evaluation must disable validation exclusion, but got "
+                f"dataset.val_num={val_num}, nersemble.val_id={nersemble_val_id}"
+            )
+        if holdout_item_count <= 0:
+            raise RuntimeError(f"Holdout metadata is empty. holdout_ids={holdout_ids}, holdout_meta={holdout_meta}")
+        if holdout_dataset_len <= 0:
             raise RuntimeError(
                 f"Holdout train-style evaluation produced zero samples. holdout_ids={holdout_ids}, "
-                f"holdout_meta={holdout_meta}, holdout_item_count={holdout_item_count}"
+                f"holdout_meta={holdout_meta}, holdout_item_count={holdout_item_count}, "
+                f"dataset.val_num={val_num}, nersemble.val_id={nersemble_val_id}, "
+                f"validation_exclusion_disabled={validation_exclusion_disabled}"
             )
-        print("[P9.2ABC-EVAL] eval_protocol=holdout_trainstyle")
+        print("[P9.2ABC-EVAL] eval_protocol=holdout_trainstyle_no_val_exclusion")
         print(f"[P9.2ABC-EVAL] holdout_ids={holdout_ids}")
+        print(f"[P9.2ABC-EVAL] holdout_metadata_path={holdout_meta}")
+        print(f"[P9.2ABC-EVAL] holdout_item_count={holdout_item_count}")
+        print(f"[P9.2ABC-EVAL] dataset.val_num={val_num}")
+        print(f"[P9.2ABC-EVAL] nersemble.val_id={nersemble_val_id}")
+        print(f"[P9.2ABC-EVAL] holdout_dataset_len={holdout_dataset_len}")
+        print(f"[P9.2ABC-EVAL] validation_exclusion_disabled={validation_exclusion_disabled}")
         print(f"[P9.2ABC-EVAL] train_ids_used_for_adapter={train_ids}")
-        print(f"[P9.2ABC-EVAL] eval_count={len(loader.dataset)}")
+        print(f"[P9.2ABC-EVAL] eval_count={holdout_dataset_len}")
     else:
         generate_metadata(base_config, paths)
         val_id, selected_ids = choose_val_id(Path(paths["generated_meta"]), str(paths["preferred_val_id"]))
@@ -1192,6 +1215,7 @@ def main() -> None:
         "holdout_train_ids_disjoint": holdout_train_ids_disjoint,
         "allow_fallback_to_train": bool(args.allow_fallback_to_train),
         "split_counts": split_counts,
+        "validation_exclusion_disabled": locals().get("validation_exclusion_disabled", None),
         "val_id_diagnostics": val_id_diagnostics,
         "batch_idx": args.batch_idx,
         "num_batches": args.num_batches,
