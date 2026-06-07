@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Strict same-batch no-grad P9.2 A/B/C evaluation.
+"""Strict same-batch no-grad P9.2 A/B/C/D evaluation.
 
 This script resolves the same local metadata/root overrides as the P9.2 smoke
-runner, loads one fixed FastAvatar batch, and evaluates three model variants on
-that exact batch without optimizer/backward/checkpointing.
+runner, loads fixed FastAvatar batches, and evaluates four model variants on
+exactly the same data without optimizer/backward/checkpointing.
 """
 from __future__ import annotations
 
@@ -141,6 +141,28 @@ def write_resolved_config(base_config: Path, cfg: Any, paths: dict[str, Path | s
     return runtime_path
 
 
+VARIANTS = (
+    "A_normal_no_token",
+    "B_zero_no_token",
+    "C_zero_gt_token_trained_adapter",
+    "D_zero_gt_token_random_adapter",
+)
+
+VARIANT_LABELS = {
+    "A_normal_no_token": "A normal",
+    "B_zero_no_token": "B zero",
+    "C_zero_gt_token_trained_adapter": "C trained token",
+    "D_zero_gt_token_random_adapter": "D random token",
+}
+
+VARIANT_SHORT = {
+    "A_normal_no_token": "A",
+    "B_zero_no_token": "B",
+    "C_zero_gt_token_trained_adapter": "C",
+    "D_zero_gt_token_random_adapter": "D",
+}
+
+
 def make_variant_config(cfg: Any, name: str, adapter_ckpt: Path | None) -> Any:
     out = copy.deepcopy(cfg)
     out.model.debug_skip_renderer = False
@@ -160,7 +182,7 @@ def make_variant_config(cfg: Any, name: str, adapter_ckpt: Path | None) -> Any:
         out.model.motion_token_source = "none"
         out.model.freeze_backbone_for_motion_token = False
         out.model.motion_token_train_adapter_only_strict = False
-    elif name == "C_zero_gt_token":
+    elif name in ("C_zero_gt_token", "C_zero_gt_token_trained_adapter"):
         out.model.use_motion_token = True
         out.model.zero_flame_motion = True
         out.model.motion_token_source = "frame_flame_gt"
@@ -168,6 +190,13 @@ def make_variant_config(cfg: Any, name: str, adapter_ckpt: Path | None) -> Any:
         out.model.motion_token_train_adapter_only_strict = True
         if adapter_ckpt is not None:
             out.saver.load_model = str(adapter_ckpt)
+    elif name == "D_zero_gt_token_random_adapter":
+        out.model.use_motion_token = True
+        out.model.zero_flame_motion = True
+        out.model.motion_token_source = "frame_flame_gt"
+        out.model.freeze_backbone_for_motion_token = True
+        out.model.motion_token_train_adapter_only_strict = True
+        out.saver.load_model = None
     else:
         raise ValueError(f"Unknown variant {name}")
     return out
@@ -463,6 +492,18 @@ def save_render_images(outputs: dict[str, Any], out_dir: Path, prefix: str, max_
     return saved
 
 
+def save_first_render_image(outputs: dict[str, Any], path: Path) -> list[str]:
+    frame = first_image_frame_from_outputs(outputs)
+    if frame is None:
+        print(f"[P9.2ABC-EVAL][WARN] No valid image tensor for {path.name}; skip image saving.")
+        return []
+    from torchvision.utils import save_image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_image(frame, path)
+    return [str(path)]
+
+
 def first_image_frame_from_outputs(outputs: Any) -> torch.Tensor | None:
     found = find_first_image_tensor(outputs, max_frames=1)
     if found is None:
@@ -476,7 +517,7 @@ def save_variant_grid(frames_by_variant: dict[str, torch.Tensor], path: Path) ->
         return None
     from torchvision.utils import make_grid, save_image
 
-    ordered = [name for name in ("A_normal_no_token", "B_zero_no_token", "C_zero_gt_token") if name in frames_by_variant]
+    ordered = [name for name in VARIANTS if name in frames_by_variant]
     if not ordered:
         return None
     tensors = [frames_by_variant[name] for name in ordered]
@@ -490,6 +531,71 @@ def save_variant_grid(frames_by_variant: dict[str, torch.Tensor], path: Path) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     save_image(grid, path)
     return str(path)
+
+
+def _summarize_value(value: Any, max_items: int = 4) -> Any:
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu()
+        if tensor.numel() == 0:
+            return []
+        if tensor.numel() <= max_items:
+            return tensor.reshape(-1).tolist()
+        return tensor.reshape(-1)[:max_items].tolist()
+    if isinstance(value, (list, tuple)):
+        return [_summarize_value(v, max_items=max_items) for v in value[:max_items]]
+    if isinstance(value, dict):
+        return {str(k): _summarize_value(v, max_items=max_items) for k, v in list(value.items())[:max_items]}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _first_existing(batch: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in batch:
+            return _summarize_value(batch[key])
+    return None
+
+
+def extract_batch_identity(batch: dict[str, Any], split: str, batch_idx: int) -> dict[str, Any]:
+    uid = _first_existing(batch, ("uid", "uids", "subject_id", "identity_id", "id"))
+    return {
+        "split": split,
+        "batch_idx": batch_idx,
+        "uid": uid,
+        "subject_id": _first_existing(batch, ("subject_id", "identity_id", "id")) or uid,
+        "frame_id": _first_existing(batch, ("frame_id", "frame_ids", "target_frame_id", "target_frame_ids", "frame_idx", "target_frame_idx")),
+        "metadata_key": _first_existing(batch, ("key", "keys", "meta_key", "metadata_key", "sample_key", "path")),
+        "metadata_path": _first_existing(batch, ("metadata_path", "meta_path")),
+        "source_image_path": _first_existing(batch, ("source_image_path", "input_image_path", "image_path", "rgb_path", "rgbs_path")),
+        "target_image_path": _first_existing(batch, ("target_image_path", "target_rgb_path", "target_rgbs_path")),
+        "available_batch_keys": sorted(str(k) for k in batch.keys()),
+    }
+
+
+def write_batch_identity_files(identities: list[dict[str, Any]], output_dir: Path) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "batch_identity.json"
+    csv_path = output_dir / "batch_identity.csv"
+    json_path.write_text(json.dumps(json_safe(identities), ensure_ascii=False, indent=2), encoding="utf-8")
+    fieldnames = [
+        "split",
+        "batch_idx",
+        "uid",
+        "subject_id",
+        "frame_id",
+        "metadata_key",
+        "metadata_path",
+        "source_image_path",
+        "target_image_path",
+        "available_batch_keys",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in identities:
+            writer.writerow({key: json.dumps(json_safe(row.get(key)), ensure_ascii=False) for key in fieldnames})
+    return json_path, csv_path
 
 
 def mean_std(values: list[float]) -> dict[str, float | None]:
@@ -509,37 +615,62 @@ def fmt_float(value: float | None, digits: int = 6) -> str:
 
 
 def compute_aggregate(per_batch_results: dict[int, dict[str, Any]]) -> dict[str, Any]:
-    variants = ["A_normal_no_token", "B_zero_no_token", "C_zero_gt_token"]
     aggregate: dict[str, Any] = {"variants": {}, "improvement": {}}
-    for variant in variants:
+    for variant in VARIANTS:
         losses = [rows.get(variant, {}).get("losses", {}) for rows in per_batch_results.values()]
         aggregate["variants"][variant] = {
             "total_loss": mean_std([loss.get("total_loss") for loss in losses]),
             "r_pixel": mean_std([loss.get("r_pixel") for loss in losses]),
         }
 
-    abs_improvements = []
-    rel_improvements = []
+    b_minus_c: list[float] = []
+    b_minus_d: list[float] = []
+    d_minus_c: list[float] = []
+    rel_b_minus_c: list[float] = []
+    rel_b_minus_d: list[float] = []
     c_lt_b_count = 0
-    compared = 0
+    d_lt_b_count = 0
+    c_lt_d_count = 0
+    compared_bc = 0
+    compared_bd = 0
+    compared_cd = 0
     for rows in per_batch_results.values():
-        b = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
-        c = rows.get("C_zero_gt_token", {}).get("losses", {}).get("r_pixel")
-        if b is None or c is None:
-            continue
-        b = float(b)
-        c = float(c)
-        improvement = b - c
-        abs_improvements.append(improvement)
-        if b != 0.0:
-            rel_improvements.append(improvement / b)
-        c_lt_b_count += int(c < b)
-        compared += 1
+        b_val = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
+        c_val = rows.get("C_zero_gt_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
+        d_val = rows.get("D_zero_gt_token_random_adapter", {}).get("losses", {}).get("r_pixel")
+        b = None if b_val is None else float(b_val)
+        c = None if c_val is None else float(c_val)
+        d = None if d_val is None else float(d_val)
+        if b is not None and c is not None:
+            diff = b - c
+            b_minus_c.append(diff)
+            if b != 0.0:
+                rel_b_minus_c.append(diff / b)
+            c_lt_b_count += int(c < b)
+            compared_bc += 1
+        if b is not None and d is not None:
+            diff = b - d
+            b_minus_d.append(diff)
+            if b != 0.0:
+                rel_b_minus_d.append(diff / b)
+            d_lt_b_count += int(d < b)
+            compared_bd += 1
+        if c is not None and d is not None:
+            d_minus_c.append(d - c)
+            c_lt_d_count += int(c < d)
+            compared_cd += 1
     aggregate["improvement"] = {
-        "b_minus_c_r_pixel": mean_std(abs_improvements),
-        "relative_b_minus_c_over_b": mean_std(rel_improvements),
-        "percent_batches_c_lt_b": None if compared == 0 else c_lt_b_count / compared,
-        "num_compared_batches": compared,
+        "b_minus_c_r_pixel": mean_std(b_minus_c),
+        "relative_b_minus_c_over_b": mean_std(rel_b_minus_c),
+        "b_minus_d_r_pixel": mean_std(b_minus_d),
+        "relative_b_minus_d_over_b": mean_std(rel_b_minus_d),
+        "d_minus_c_r_pixel": mean_std(d_minus_c),
+        "percent_batches_c_lt_b": None if compared_bc == 0 else c_lt_b_count / compared_bc,
+        "percent_batches_d_lt_b": None if compared_bd == 0 else d_lt_b_count / compared_bd,
+        "percent_batches_c_lt_d": None if compared_cd == 0 else c_lt_d_count / compared_cd,
+        "num_compared_batches_bc": compared_bc,
+        "num_compared_batches_bd": compared_bd,
+        "num_compared_batches_cd": compared_cd,
     }
     return aggregate
 
@@ -556,6 +687,7 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
         "r_ssim",
         "r_id",
         "adapter_loaded",
+        "random_adapter",
         "images",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -573,6 +705,7 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
                     "r_ssim": losses.get("r_ssim"),
                     "r_id": losses.get("r_id"),
                     "adapter_loaded": row.get("adapter_loaded", False),
+                    "random_adapter": row.get("random_adapter", False),
                     "images": ";".join(row.get("images", [])),
                 })
     return path
@@ -598,27 +731,51 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     per_batch_results = metrics.get("per_batch_results", {})
     variant_configs = metrics.get("variant_configs", {})
     improvement = aggregate.get("improvement", {})
-    c_lt_b_pct = improvement.get("percent_batches_c_lt_b")
     b_minus_c = improvement.get("b_minus_c_r_pixel", {})
-    rel = improvement.get("relative_b_minus_c_over_b", {})
+    rel_bc = improvement.get("relative_b_minus_c_over_b", {})
+    b_minus_d = improvement.get("b_minus_d_r_pixel", {})
+    rel_bd = improvement.get("relative_b_minus_d_over_b", {})
+    d_minus_c = improvement.get("d_minus_c_r_pixel", {})
+    c_lt_b_pct = improvement.get("percent_batches_c_lt_b")
+    d_lt_b_pct = improvement.get("percent_batches_d_lt_b")
+    c_lt_d_pct = improvement.get("percent_batches_c_lt_d")
 
     lines = [
-        "# P9.2 Same-Batch A/B/C Evaluation",
+        "# P9.2 Same-Batch A/B/C/D Evaluation",
         "",
         "## Run Selection",
-        f"* split: `{metrics.get('split')}`",
+        f"* requested split: `{metrics.get('requested_split')}`",
+        f"* evaluated split: `{metrics.get('split')}`",
+        f"* allow_fallback_to_train: `{metrics.get('allow_fallback_to_train')}`",
+        f"* split counts: `{metrics.get('split_counts')}`",
+        f"* selected_ids: `{metrics.get('selected_ids')}`",
+        f"* val_id: `{metrics.get('val_id')}`",
         f"* batch_idx start: `{metrics.get('batch_idx')}`",
         f"* requested num_batches: `{metrics.get('num_batches')}`",
         f"* evaluated batch indices: `{metrics.get('evaluated_batch_indices')}`",
         "",
         "## Configs",
-        "| Variant | use_motion_token | zero_flame_motion | motion_token_source | adapter_loaded |",
-        "|---|---:|---:|---|---:|",
+        "| Variant | label | use_motion_token | zero_flame_motion | motion_token_source | adapter_loaded | random_adapter |",
+        "|---|---|---:|---:|---|---:|---:|",
     ]
     for name, cfg in variant_configs.items():
         lines.append(
-            f"| {name} | {cfg.get('use_motion_token')} | {cfg.get('zero_flame_motion')} | "
-            f"{cfg.get('motion_token_source')} | {cfg.get('adapter_loaded', False)} |"
+            f"| {name} | {cfg.get('label', '')} | {cfg.get('use_motion_token')} | {cfg.get('zero_flame_motion')} | "
+            f"{cfg.get('motion_token_source')} | {cfg.get('adapter_loaded', False)} | {cfg.get('random_adapter', False)} |"
+        )
+
+    identities = metrics.get("batch_identities", [])
+    lines += [
+        "",
+        "## Evaluated Samples",
+        "| split | batch_idx | uid | subject_id | frame_id | metadata_key | source_image_path | target_image_path |",
+        "|---|---:|---|---|---|---|---|---|",
+    ]
+    for identity in identities:
+        lines.append(
+            f"| {identity.get('split')} | {identity.get('batch_idx')} | {identity.get('uid')} | "
+            f"{identity.get('subject_id')} | {identity.get('frame_id')} | {identity.get('metadata_key')} | "
+            f"{identity.get('source_image_path')} | {identity.get('target_image_path')} |"
         )
 
     lines += [
@@ -639,24 +796,33 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         "",
         "## Relative Improvement",
         f"* B - C r_pixel mean/std: {fmt_float(b_minus_c.get('mean'))} / {fmt_float(b_minus_c.get('std'))}",
-        f"* (B - C) / B mean/std: {fmt_float(rel.get('mean'), 4)} / {fmt_float(rel.get('std'), 4)}",
+        f"* (B - C) / B mean/std: {fmt_float(rel_bc.get('mean'), 4)} / {fmt_float(rel_bc.get('std'), 4)}",
+        f"* B - D r_pixel mean/std: {fmt_float(b_minus_d.get('mean'))} / {fmt_float(b_minus_d.get('std'))}",
+        f"* (B - D) / B mean/std: {fmt_float(rel_bd.get('mean'), 4)} / {fmt_float(rel_bd.get('std'), 4)}",
+        f"* D - C r_pixel gap mean/std: {fmt_float(d_minus_c.get('mean'))} / {fmt_float(d_minus_c.get('std'))}",
         f"* Percentage of batches where C < B: {'N/A' if c_lt_b_pct is None else f'{c_lt_b_pct:.2%}'}",
+        f"* Percentage of batches where D < B: {'N/A' if d_lt_b_pct is None else f'{d_lt_b_pct:.2%}'}",
+        f"* Percentage of batches where C < D: {'N/A' if c_lt_d_pct is None else f'{c_lt_d_pct:.2%}'}",
         "",
         "## Per-Batch Losses",
-        "| batch_idx | A r_pixel | B r_pixel | C r_pixel | B-C | (B-C)/B | C < B |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| batch_idx | A r_pixel | B r_pixel | C r_pixel | D r_pixel | B-C | B-D | D-C | C < B | D < B | C < D |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for batch_idx in sorted(int(k) for k in per_batch_results.keys()):
         rows = per_batch_results[batch_idx]
         a = rows.get("A_normal_no_token", {}).get("losses", {}).get("r_pixel")
         b = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
-        c = rows.get("C_zero_gt_token", {}).get("losses", {}).get("r_pixel")
-        diff = None if b is None or c is None else b - c
-        rel_diff = None if diff is None or not b else diff / b
+        c = rows.get("C_zero_gt_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
+        d = rows.get("D_zero_gt_token_random_adapter", {}).get("losses", {}).get("r_pixel")
+        bc = None if b is None or c is None else b - c
+        bd = None if b is None or d is None else b - d
+        dc = None if d is None or c is None else d - c
         c_lt_b = c is not None and b is not None and c < b
+        d_lt_b = d is not None and b is not None and d < b
+        c_lt_d = c is not None and d is not None and c < d
         lines.append(
-            f"| {batch_idx} | {fmt_float(a)} | {fmt_float(b)} | {fmt_float(c)} | "
-            f"{fmt_float(diff)} | {fmt_float(rel_diff, 4)} | {c_lt_b} |"
+            f"| {batch_idx} | {fmt_float(a)} | {fmt_float(b)} | {fmt_float(c)} | {fmt_float(d)} | "
+            f"{fmt_float(bc)} | {fmt_float(bd)} | {fmt_float(dc)} | {c_lt_b} | {d_lt_b} | {c_lt_d} |"
         )
 
     lines += [
@@ -666,14 +832,19 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     if c_lt_b_pct is None:
         lines.append("* No comparable B/C r_pixel batches were evaluated.")
     elif c_lt_b_pct > 0.5:
-        lines.append("* C improves over B on most evaluated batches, suggesting the GT motion token helps under zeroed FLAME motion.")
+        lines.append("* C improves over B on most evaluated batches, suggesting the trained GT motion token helps under zeroed FLAME motion.")
     else:
         lines.append("* C does not improve over B on most evaluated batches; this may indicate adapter overfit to a different batch or weak token conditioning.")
+    if c_lt_d_pct is not None:
+        if c_lt_d_pct > 0.5:
+            lines.append("* C is better than random-adapter D on most batches, supporting that adapter training matters.")
+        else:
+            lines.append("* D is competitive with or better than C on many batches; diagnose whether token conditioning is too weak or the batch is out-of-distribution.")
     (output_dir / "comparison_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Strict same-batch P9.2 A/B/C no-grad evaluation.")
+    parser = argparse.ArgumentParser(description="Strict same-batch P9.2 A/B/C/D no-grad evaluation.")
     parser.add_argument("--base_config", type=Path, default=Path("configs/train/fastavatar_motion_zero_token_overfit_micro_render.yaml"))
     parser.add_argument("--local_paths_config", type=Path, default=Path("configs/local/p9_2_local_paths.yaml"))
     parser.add_argument("--adapter_ckpt", type=Path, default=Path("exps/checkpoints/fastavatar/fastavatar_motion_zero_token_overfit_micro_render_20step/000020/model.safetensors"))
@@ -685,6 +856,7 @@ def main() -> None:
     parser.add_argument("--no_save_images", dest="save_images", action="store_false")
     parser.add_argument("--max_save_frames", type=int, default=4)
     parser.add_argument("--debug_output_shapes", action="store_true")
+    parser.add_argument("--allow_fallback_to_train", action="store_true", help="Allow an explicit val->train fallback when the requested split is empty.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -706,13 +878,30 @@ def main() -> None:
     print(f"[P9.2ABC-EVAL] selected_ids={selected_ids} val_id={val_id}")
     print(f"[P9.2ABC-EVAL] device={device}")
 
-    loader = build_loader(cfg, args.split)
+    train_loader = build_loader(cfg, "train")
+    val_loader = build_loader(cfg, "val")
+    loaders = {"train": train_loader, "val": val_loader}
+    split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
+    print(f"[P9.2ABC-EVAL] split_counts={split_counts} requested_split={args.split}")
+
+    actual_split = args.split
+    loader = loaders[actual_split]
     if len(loader.dataset) == 0:
-        fallback = "train" if args.split == "val" else "val"
-        print(f"[P9.2ABC-EVAL][WARN] split={args.split} has zero samples; falling back to {fallback}")
-        loader = build_loader(cfg, fallback)
+        error = (
+            f"Requested split={args.split} has zero samples. selected_ids={selected_ids}, "
+            f"val_id={val_id}, train_count={split_counts['train']}, val_count={split_counts['val']}."
+        )
+        if args.split == "val" and args.allow_fallback_to_train:
+            print(f"[P9.2ABC-EVAL][WARN] {error} Explicit --allow_fallback_to_train enabled; using train split.")
+            actual_split = "train"
+            loader = train_loader
+        else:
+            raise RuntimeError(error + " Refusing silent fallback; pass --allow_fallback_to_train to evaluate train intentionally.")
     if len(loader.dataset) == 0:
-        raise RuntimeError("No samples available for same-batch evaluation")
+        raise RuntimeError(
+            f"No samples available for same-batch evaluation after split resolution. "
+            f"selected_ids={selected_ids}, val_id={val_id}, split_counts={split_counts}"
+        )
 
     selected_batches: list[tuple[int, dict[str, Any]]] = []
     stop_after = args.batch_idx + args.num_batches
@@ -725,26 +914,29 @@ def main() -> None:
     if not selected_batches:
         raise RuntimeError(
             f"Could not fetch any batches for batch_idx={args.batch_idx}, "
-            f"num_batches={args.num_batches}; dataset size={len(loader.dataset)}"
+            f"num_batches={args.num_batches}; split={actual_split}; dataset size={len(loader.dataset)}"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     image_dir = output_dir / "images"
-    grid_dir = output_dir / "image_grids"
-    variants = ["A_normal_no_token", "B_zero_no_token", "C_zero_gt_token"]
+    grid_dir = output_dir / "grids"
+    variants = list(VARIANTS)
     per_batch_results: dict[int, dict[str, Any]] = {idx: {} for idx, _ in selected_batches}
     batch_motion_summaries: dict[int, dict[str, Any]] = {}
     grid_frames_by_batch: dict[int, dict[str, torch.Tensor]] = {idx: {} for idx, _ in selected_batches}
     variant_configs: dict[str, Any] = {}
 
     for name in variants:
-        variant_cfg = make_variant_config(cfg, name, adapter_ckpt if adapter_ckpt and adapter_ckpt.exists() else None)
-        model, adapter_loaded = load_model_for_variant(variant_cfg, adapter_ckpt, device)
+        ckpt_for_variant = adapter_ckpt if name == "C_zero_gt_token_trained_adapter" and adapter_ckpt and adapter_ckpt.exists() else None
+        variant_cfg = make_variant_config(cfg, name, ckpt_for_variant)
+        model, adapter_loaded = load_model_for_variant(variant_cfg, ckpt_for_variant, device)
         variant_configs[name] = {
             "use_motion_token": bool(variant_cfg.model.use_motion_token),
             "zero_flame_motion": bool(variant_cfg.model.zero_flame_motion),
             "motion_token_source": str(variant_cfg.model.motion_token_source),
             "adapter_loaded": adapter_loaded,
+            "random_adapter": name == "D_zero_gt_token_random_adapter",
+            "label": VARIANT_LABELS.get(name, name),
         }
         for batch_idx, batch_cpu in selected_batches:
             batch = move_to_device(batch_cpu, device)
@@ -756,18 +948,15 @@ def main() -> None:
                 print_output_debug_shapes(outputs, prefix=f"outputs.{name}.batch{batch_idx}")
             images: list[str] = []
             if args.save_images:
-                images = save_render_images(
-                    outputs,
-                    image_dir,
-                    f"{name.split('_', 1)[0]}_batch{batch_idx:04d}",
-                    max_frames=args.max_save_frames,
-                )
+                short = VARIANT_SHORT.get(name, name[:1])
+                images = save_first_render_image(outputs, image_dir / f"batch_{batch_idx:03d}_{short}.png")
                 first_frame = first_image_frame_from_outputs(outputs)
                 if first_frame is not None:
                     grid_frames_by_batch[batch_idx][name] = first_frame
             per_batch_results[batch_idx][name] = {
                 "config": variant_configs[name],
                 "adapter_loaded": adapter_loaded,
+                "random_adapter": name == "D_zero_gt_token_random_adapter",
                 "losses": losses,
                 "images": images,
             }
@@ -785,8 +974,10 @@ def main() -> None:
     image_grids: dict[int, str | None] = {}
     if args.save_images:
         for batch_idx, frames in grid_frames_by_batch.items():
-            image_grids[batch_idx] = save_variant_grid(frames, grid_dir / f"batch{batch_idx:04d}_ABC.png")
+            image_grids[batch_idx] = save_variant_grid(frames, grid_dir / f"batch_{batch_idx:03d}_grid.png")
 
+    batch_identities = [extract_batch_identity(batch, actual_split, idx) for idx, batch in selected_batches]
+    identity_json_path, identity_csv_path = write_batch_identity_files(batch_identities, output_dir)
     aggregate = compute_aggregate(per_batch_results)
     csv_path = write_per_batch_csv(per_batch_results, output_dir)
 
@@ -796,13 +987,19 @@ def main() -> None:
         "output_dir": output_dir,
         "selected_ids": selected_ids,
         "val_id": val_id,
-        "split": args.split,
+        "requested_split": args.split,
+        "split": actual_split,
+        "allow_fallback_to_train": bool(args.allow_fallback_to_train),
+        "split_counts": split_counts,
         "batch_idx": args.batch_idx,
         "num_batches": args.num_batches,
         "evaluated_batch_indices": [idx for idx, _ in selected_batches],
         "adapter_ckpt": adapter_ckpt,
         "adapter_ckpt_exists": bool(adapter_ckpt and adapter_ckpt.exists()),
         "batch_motion_summaries": batch_motion_summaries,
+        "batch_identities": batch_identities,
+        "batch_identity_json": identity_json_path,
+        "batch_identity_csv": identity_csv_path,
         "variant_configs": variant_configs,
         "per_batch_results": per_batch_results,
         "aggregate": aggregate,
