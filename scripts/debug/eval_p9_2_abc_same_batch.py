@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -676,19 +677,104 @@ def _first_existing(batch: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
-def extract_batch_identity(batch: dict[str, Any], split: str, eval_protocol: str, batch_idx: int) -> dict[str, Any]:
-    uid = _first_existing(batch, ("uid", "uids", "subject_id", "identity_id", "id"))
+SUBJECT_FIELD_KEYS = ("uid", "uids", "subject_id", "person_id", "identity_id", "sequence_id")
+METADATA_KEY_FIELDS = ("key", "keys", "frame_group_key", "meta_key", "metadata_key", "item_key", "data_key", "sample_key", "path", "metadata_path", "meta_path")
+FRAME_ID_KEYS = ("frame_id", "frame_ids", "target_frame_id", "target_frame_ids", "frame_idx", "frame_idxs", "target_frame_idx", "target_frame_idxs", "frame", "frames")
+CAMERA_ID_KEYS = ("camera", "cameras", "camera_id", "camera_ids", "cam_id", "cam_ids", "cam", "cams")
+SOURCE_IMAGE_KEYS = ("source_image_path", "input_image_path", "image_path", "rgb_path", "rgbs_path")
+TARGET_IMAGE_KEYS = ("target_image_path", "target_rgb_path", "target_rgbs_path")
+
+
+def _flatten_debug_strings(value: Any, max_items: int = 32) -> list[str]:
+    if value is None:
+        return []
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu().reshape(-1)
+        return [str(v.item()) for v in tensor[:max_items]]
+    if isinstance(value, (str, int, float, bool)):
+        return [str(value)]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in list(value)[:max_items]:
+            out.extend(_flatten_debug_strings(item, max_items=max_items))
+        return out
+    if isinstance(value, dict):
+        out: list[str] = []
+        for item in list(value.values())[:max_items]:
+            out.extend(_flatten_debug_strings(item, max_items=max_items))
+        return out
+    return [str(value)]
+
+
+def _values_for_keys(batch: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    out: list[str] = []
+    for key in keys:
+        if key in batch:
+            out.extend(_flatten_debug_strings(batch[key]))
+    return out
+
+
+def _metadata_tokens_from_strings(values: list[str]) -> list[str]:
+    tokens: set[str] = set()
+    for value in values:
+        for token in re.split(r"[^A-Za-z0-9_\-.]+", str(value)):
+            if token:
+                tokens.add(token)
+    return sorted(tokens)
+
+
+def _subject_uid_from_string(value: str, known_subject_ids: set[str]) -> str | None:
+    text = str(value).strip()
+    if text in known_subject_ids:
+        return text
+    patterns = (
+        r"(?:^|/)nersemble/(\d{3})(?:/|$)",
+        r"^(\d{3})(?:/|$)",
+        r"(?:^|/)(\d{3})/[A-Za-z0-9_\-.]+",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match and match.group(1) in known_subject_ids:
+            return match.group(1)
+    return None
+
+
+def extract_subject_uids(batch: dict[str, Any], known_subject_ids: set[str]) -> list[str]:
+    subjects: set[str] = set()
+    # Explicit subject fields have priority, but still must match a known subject.
+    for value in _values_for_keys(batch, SUBJECT_FIELD_KEYS):
+        uid = _subject_uid_from_string(value, known_subject_ids)
+        if uid is not None:
+            subjects.add(uid)
+    if subjects:
+        return sorted(subjects)
+    # Fall back to strict metadata key/path parsing.
+    for value in _values_for_keys(batch, METADATA_KEY_FIELDS):
+        uid = _subject_uid_from_string(value, known_subject_ids)
+        if uid is not None:
+            subjects.add(uid)
+    return sorted(subjects)
+
+
+def extract_batch_identity(batch: dict[str, Any], split: str, eval_protocol: str, batch_idx: int, known_subject_ids: set[str]) -> dict[str, Any]:
+    subject_uids = extract_subject_uids(batch, known_subject_ids)
+    metadata_values = _values_for_keys(batch, METADATA_KEY_FIELDS + SOURCE_IMAGE_KEYS + TARGET_IMAGE_KEYS)
+    camera_values = _values_for_keys(batch, CAMERA_ID_KEYS)
+    frame_values = _values_for_keys(batch, FRAME_ID_KEYS)
+    observed_tokens = _metadata_tokens_from_strings(metadata_values + camera_values + frame_values)
+    camera_ids = sorted({token for token in observed_tokens + camera_values if re.fullmatch(r"cam_?\d+", str(token))})
     return {
         "split": split,
         "eval_protocol": eval_protocol,
         "batch_idx": batch_idx,
-        "uid": uid,
-        "subject_id": _first_existing(batch, ("subject_id", "identity_id", "id")) or uid,
-        "frame_id": _first_existing(batch, ("frame_id", "frame_ids", "target_frame_id", "target_frame_ids", "frame_idx", "target_frame_idx")),
-        "metadata_key": _first_existing(batch, ("key", "keys", "meta_key", "metadata_key", "sample_key", "path")),
-        "metadata_path": _first_existing(batch, ("metadata_path", "meta_path")),
-        "source_image_path": _first_existing(batch, ("source_image_path", "input_image_path", "image_path", "rgb_path", "rgbs_path")),
-        "target_image_path": _first_existing(batch, ("target_image_path", "target_rgb_path", "target_rgbs_path")),
+        "subject_uid": subject_uids[0] if subject_uids else None,
+        "subject_uids": subject_uids,
+        "metadata_key": _first_existing(batch, METADATA_KEY_FIELDS),
+        "frame_id": _first_existing(batch, FRAME_ID_KEYS),
+        "camera_ids": camera_ids,
+        "source_image_path": _first_existing(batch, SOURCE_IMAGE_KEYS),
+        "target_image_path": _first_existing(batch, TARGET_IMAGE_KEYS),
+        "observed_metadata_tokens": observed_tokens,
         "available_batch_keys": sorted(str(k) for k in batch.keys()),
     }
 
@@ -702,14 +788,13 @@ def write_batch_identity_files(identities: list[dict[str, Any]], output_dir: Pat
         "split",
         "eval_protocol",
         "batch_idx",
-        "uid",
-        "subject_id",
-        "frame_id",
+        "subject_uid",
         "metadata_key",
-        "metadata_path",
+        "frame_id",
+        "camera_ids",
         "source_image_path",
         "target_image_path",
-        "available_batch_keys",
+        "observed_metadata_tokens",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -719,35 +804,20 @@ def write_batch_identity_files(identities: list[dict[str, Any]], output_dir: Pat
     return json_path, csv_path
 
 
-def _collect_identity_strings(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (int, float)):
-        return [str(value)]
-    if isinstance(value, (list, tuple, set)):
-        out: list[str] = []
-        for item in value:
-            out.extend(_collect_identity_strings(item))
-        return out
-    if isinstance(value, dict):
-        out: list[str] = []
-        for item in value.values():
-            out.extend(_collect_identity_strings(item))
-        return out
-    return [str(value)]
-
-
-def evaluated_uids_from_identities(identities: list[dict[str, Any]]) -> list[str]:
+def evaluated_subject_uids_from_identities(identities: list[dict[str, Any]]) -> list[str]:
     ids: set[str] = set()
     for identity in identities:
-        for field in ("uid", "subject_id", "metadata_key"):
-            for value in _collect_identity_strings(identity.get(field)):
-                value = value.strip()
-                if value:
-                    ids.add(extract_uid(value))
+        for uid in identity.get("subject_uids") or []:
+            ids.add(str(uid))
     return sorted(ids)
+
+
+def observed_tokens_from_identities(identities: list[dict[str, Any]]) -> list[str]:
+    tokens: set[str] = set()
+    for identity in identities:
+        for token in identity.get("observed_metadata_tokens") or []:
+            tokens.add(str(token))
+    return sorted(tokens)
 
 
 def mean_std(values: list[float]) -> dict[str, float | None]:
@@ -905,7 +975,7 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         f"* holdout IDs: `{metrics.get('holdout_ids')}`",
         f"* sacrificial val ID: `{metrics.get('sacrificial_val_id')}`",
         f"* metadata IDs: `{metrics.get('metadata_ids')}`",
-        f"* evaluated UIDs: `{metrics.get('evaluated_uids')}`",
+        f"* evaluated subject UIDs: `{metrics.get('evaluated_subject_uids')}`",
         f"* holdout/train disjoint: `{metrics.get('holdout_train_ids_disjoint')}`",
         f"* selected_ids: `{metrics.get('selected_ids')}`",
         f"* val_id: `{metrics.get('val_id')}`",
@@ -927,15 +997,25 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     lines += [
         "",
         "## Evaluated Samples",
-        "| split | eval_protocol | batch_idx | uid | subject_id | frame_id | metadata_key | source_image_path | target_image_path |",
-        "|---|---|---:|---|---|---|---|---|---|",
+        "| split | eval_protocol | batch_idx | subject_uid | metadata_key | frame_id | camera_ids |",
+        "|---|---|---:|---|---|---|---|",
     ]
     for identity in identities:
         lines.append(
-            f"| {identity.get('split')} | {identity.get('eval_protocol')} | {identity.get('batch_idx')} | {identity.get('uid')} | "
-            f"{identity.get('subject_id')} | {identity.get('frame_id')} | {identity.get('metadata_key')} | "
-            f"{identity.get('source_image_path')} | {identity.get('target_image_path')} |"
+            f"| {identity.get('split')} | {identity.get('eval_protocol')} | {identity.get('batch_idx')} | "
+            f"{identity.get('subject_uid')} | {identity.get('metadata_key')} | {identity.get('frame_id')} | "
+            f"{identity.get('camera_ids')} |"
         )
+
+    lines += [
+        "",
+        "## Identity Sanity Check",
+        f"* evaluated_subject_uids: `{metrics.get('evaluated_subject_uids')}`",
+        f"* holdout_ids: `{metrics.get('holdout_ids')}`",
+        f"* train_ids: `{metrics.get('train_ids_used_for_adapter')}`",
+        f"* sacrificial_val_id: `{metrics.get('sacrificial_val_id')}`",
+        f"* pass: `{metrics.get('identity_sanity_pass')}`",
+    ]
 
     lines += [
         "",
@@ -1030,6 +1110,8 @@ def main() -> None:
     parser.add_argument("--no_save_images", dest="save_images", action="store_false")
     parser.add_argument("--max_save_frames", type=int, default=4)
     parser.add_argument("--debug_output_shapes", action="store_true")
+    parser.add_argument("--strict_subject_id_check", dest="strict_subject_id_check", action="store_true", default=True)
+    parser.add_argument("--no_strict_subject_id_check", dest="strict_subject_id_check", action="store_false")
     parser.add_argument("--allow_fallback_to_train", action="store_true", help="Allow an explicit val->train fallback when the requested split is empty.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -1064,7 +1146,6 @@ def main() -> None:
     val_id = ""
     sacrificial_val_id = ""
     metadata_ids: list[str] = []
-    evaluated_uids: list[str] = []
     if requested_protocol == "holdout_trainstyle_sacrificial_val":
         if not holdout_ids:
             raise RuntimeError("--split holdout requires at least one --holdout_ids value")
@@ -1180,28 +1261,40 @@ def main() -> None:
             f"num_batches={args.num_batches}; split={actual_split}; dataset size={len(loader.dataset)}"
         )
 
-    batch_identities = [extract_batch_identity(batch, actual_split, requested_protocol, idx) for idx, batch in selected_batches]
-    evaluated_uids = evaluated_uids_from_identities(batch_identities)
+    known_subject_ids = set(train_ids) | set(holdout_ids) | set(selected_ids) | set(metadata_ids)
+    batch_identities = [extract_batch_identity(batch, actual_split, requested_protocol, idx, known_subject_ids) for idx, batch in selected_batches]
+    evaluated_subject_uids = evaluated_subject_uids_from_identities(batch_identities)
+    observed_metadata_tokens = observed_tokens_from_identities(batch_identities)
+    identity_sanity_pass = True
     if requested_protocol == "holdout_trainstyle_sacrificial_val":
-        if not evaluated_uids:
-            raise RuntimeError("Could not verify holdout evaluated_uids from selected batch identities.")
-        outside_holdout = sorted(set(evaluated_uids) - set(holdout_ids))
+        if not evaluated_subject_uids:
+            for batch_idx, batch_cpu in selected_batches:
+                print(f"[P9.2ABC-EVAL][SubjectID][WARN] Could not extract subject UID for batch={batch_idx}; batch keys/shapes follow.")
+                print_batch_debug_shapes(batch_cpu, prefix=f"batch{batch_idx}")
+            print(f"[P9.2ABC-EVAL][SubjectID][WARN] observed_metadata_tokens={observed_metadata_tokens}")
+            identity_sanity_pass = False
+            if args.strict_subject_id_check:
+                raise RuntimeError("Could not verify holdout evaluated_subject_uids from selected batch identities.")
+        outside_holdout = sorted(set(evaluated_subject_uids) - set(holdout_ids))
         if outside_holdout:
+            identity_sanity_pass = False
             raise RuntimeError(
-                f"Holdout eval produced sample IDs outside holdout_ids. evaluated_uids={evaluated_uids}, "
-                f"holdout_ids={holdout_ids}, outside_holdout={outside_holdout}"
+                f"Holdout eval produced subject IDs outside holdout_ids. evaluated_subject_uids={evaluated_subject_uids}, "
+                f"holdout_ids={holdout_ids}, outside_holdout={outside_holdout}, observed_metadata_tokens={observed_metadata_tokens}"
             )
-        if sacrificial_val_id in set(evaluated_uids):
+        if sacrificial_val_id in set(evaluated_subject_uids):
+            identity_sanity_pass = False
             raise RuntimeError(
-                f"Holdout eval leaked sacrificial_val_id={sacrificial_val_id} into evaluated_uids={evaluated_uids}"
+                f"Holdout eval leaked sacrificial_val_id={sacrificial_val_id} into evaluated_subject_uids={evaluated_subject_uids}"
             )
-        leaked_train_ids = sorted(set(evaluated_uids) & set(train_ids))
+        leaked_train_ids = sorted(set(evaluated_subject_uids) & set(train_ids))
         if leaked_train_ids:
+            identity_sanity_pass = False
             raise RuntimeError(
-                f"Holdout eval leaked adapter-training IDs into evaluated_uids. leaked_train_ids={leaked_train_ids}, "
+                f"Holdout eval leaked adapter-training IDs into evaluated_subject_uids. leaked_train_ids={leaked_train_ids}, "
                 f"train_ids={train_ids}, holdout_ids={holdout_ids}"
             )
-        print(f"[P9.2ABC-EVAL] evaluated_uids={evaluated_uids}")
+        print(f"[P9.2ABC-EVAL] evaluated_subject_uids={evaluated_subject_uids}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     image_dir = output_dir / "images"
@@ -1293,7 +1386,9 @@ def main() -> None:
         "holdout_ids": holdout_ids,
         "sacrificial_val_id": sacrificial_val_id,
         "metadata_ids": metadata_ids,
-        "evaluated_uids": evaluated_uids,
+        "evaluated_subject_uids": evaluated_subject_uids,
+        "observed_metadata_tokens": observed_metadata_tokens,
+        "identity_sanity_pass": identity_sanity_pass,
         "holdout_train_ids_disjoint": holdout_train_ids_disjoint,
         "allow_fallback_to_train": bool(args.allow_fallback_to_train),
         "split_counts": split_counts,
