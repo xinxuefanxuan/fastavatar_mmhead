@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Strict same-batch no-grad P9.2 A/B/C/D evaluation.
+"""Strict same-batch no-grad P9.2 A/B/C/D/E/F evaluation.
 
 This script resolves the same local metadata/root overrides as the P9.2 smoke
-runner, loads fixed FastAvatar batches, and evaluates four model variants on
+runner, loads fixed FastAvatar batches, and evaluates motion-token controls on
 exactly the same data without optimizer/backward/checkpointing.
 """
 from __future__ import annotations
@@ -199,13 +199,17 @@ VARIANTS = (
     "B_zero_no_token",
     "C_zero_gt_token_trained_adapter",
     "D_zero_gt_token_random_adapter",
+    "E_zero_shuffled_token_trained_adapter",
+    "F_zero_neutral_token_trained_adapter",
 )
 
 VARIANT_LABELS = {
     "A_normal_no_token": "A-normal",
     "B_zero_no_token": "B-zero",
-    "C_zero_gt_token_trained_adapter": "C-trained-token",
-    "D_zero_gt_token_random_adapter": "D-random-token",
+    "C_zero_gt_token_trained_adapter": "C-correct-token",
+    "D_zero_gt_token_random_adapter": "D-random-adapter",
+    "E_zero_shuffled_token_trained_adapter": "E-wrong-token",
+    "F_zero_neutral_token_trained_adapter": "F-zero-token",
 }
 
 VARIANT_SHORT = {
@@ -213,6 +217,23 @@ VARIANT_SHORT = {
     "B_zero_no_token": "B",
     "C_zero_gt_token_trained_adapter": "C",
     "D_zero_gt_token_random_adapter": "D",
+    "E_zero_shuffled_token_trained_adapter": "E",
+    "F_zero_neutral_token_trained_adapter": "F",
+}
+
+TRAINED_ADAPTER_VARIANTS = {
+    "C_zero_gt_token_trained_adapter",
+    "E_zero_shuffled_token_trained_adapter",
+    "F_zero_neutral_token_trained_adapter",
+}
+
+TOKEN_OVERRIDE_BY_VARIANT = {
+    "A_normal_no_token": "none",
+    "B_zero_no_token": "none",
+    "C_zero_gt_token_trained_adapter": "correct_gt",
+    "D_zero_gt_token_random_adapter": "correct_gt_random_adapter",
+    "E_zero_shuffled_token_trained_adapter": "shuffled_gt",
+    "F_zero_neutral_token_trained_adapter": "neutral_zero",
 }
 
 
@@ -235,7 +256,7 @@ def make_variant_config(cfg: Any, name: str, adapter_ckpt: Path | None) -> Any:
         out.model.motion_token_source = "none"
         out.model.freeze_backbone_for_motion_token = False
         out.model.motion_token_train_adapter_only_strict = False
-    elif name in ("C_zero_gt_token", "C_zero_gt_token_trained_adapter"):
+    elif name in ("C_zero_gt_token", "C_zero_gt_token_trained_adapter", "E_zero_shuffled_token_trained_adapter", "F_zero_neutral_token_trained_adapter"):
         out.model.use_motion_token = True
         out.model.zero_flame_motion = True
         out.model.motion_token_source = "frame_flame_gt"
@@ -331,7 +352,13 @@ def build_flame_dicts(data: dict[str, Any]) -> tuple[dict[str, torch.Tensor], di
     return input_flame_params, target_flame_params
 
 
-def forward_and_loss(model: torch.nn.Module, cfg: Any, batch: dict[str, Any], device: torch.device) -> tuple[dict[str, Any], dict[str, float | None]]:
+def forward_and_loss(
+    model: torch.nn.Module,
+    cfg: Any,
+    batch: dict[str, Any],
+    device: torch.device,
+    motion_token_input: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], dict[str, float | None]]:
     from FastAvatar.losses import PixelLoss
 
     input_flame_params, target_flame_params = build_flame_dicts(batch)
@@ -349,6 +376,7 @@ def forward_and_loss(model: torch.nn.Module, cfg: Any, batch: dict[str, Any], de
         input_flame_params=input_flame_params,
         inf_flame_params=target_flame_params,
         uid=batch['uid'],
+        motion_token_input=motion_token_input,
     )
     losses: dict[str, float | None] = {
         "total_loss": None,
@@ -365,6 +393,91 @@ def forward_and_loss(model: torch.nn.Module, cfg: Any, batch: dict[str, Any], de
     elif "latent_smoke_loss" in outputs:
         losses["total_loss"] = tensor_scalar(outputs["latent_smoke_loss"])
     return outputs, losses
+
+
+def motion_token_input_dim(model: torch.nn.Module) -> int:
+    return int(getattr(model, "motion_token_input_dim", getattr(model, "motion_token_pad_to_dim", 96)))
+
+
+def _match_token_batch_size(token: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if token.shape[0] == batch_size:
+        return token
+    if token.shape[0] == 1:
+        return token.expand(batch_size, -1).contiguous()
+    if token.shape[0] > batch_size:
+        return token[:batch_size].contiguous()
+    repeats = math.ceil(batch_size / token.shape[0])
+    return token.repeat(repeats, 1)[:batch_size].contiguous()
+
+
+def build_motion_token_override(
+    model: torch.nn.Module,
+    variant_name: str,
+    target_batch: dict[str, Any],
+    device: torch.device,
+    donor_batch: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    mode = TOKEN_OVERRIDE_BY_VARIANT.get(variant_name, "none")
+    if mode in ("none", "correct_gt", "correct_gt_random_adapter"):
+        return None, {"motion_token_override": mode, "token_source_batch_idx": None}
+
+    batch_size = int(target_batch["target_rgbs"].shape[0])
+    if mode == "neutral_zero":
+        token = torch.zeros(batch_size, motion_token_input_dim(model), device=device, dtype=target_batch["target_rgbs"].dtype)
+        return token, {"motion_token_override": mode, "token_source_batch_idx": None}
+
+    if mode == "shuffled_gt":
+        if donor_batch is None:
+            raise RuntimeError("E_zero_shuffled_token_trained_adapter requires a donor batch for mismatched token evaluation.")
+        donor_on_device = move_to_device(donor_batch, device)
+        _, donor_target_flame = build_flame_dicts(donor_on_device)
+        token = model.build_motion_token_input_from_flame(donor_target_flame)
+        token = _match_token_batch_size(token, batch_size).to(device=device, dtype=target_batch["target_rgbs"].dtype)
+        return token, {"motion_token_override": mode, "token_source_batch_idx": None}
+
+    raise RuntimeError(f"Unsupported token override mode={mode} for variant={variant_name}")
+
+
+def select_shuffled_token_donors(
+    loader: torch.utils.data.DataLoader,
+    selected_batches: list[tuple[int, dict[str, Any]]],
+) -> dict[int, tuple[int, dict[str, Any]]]:
+    if not selected_batches:
+        return {}
+    selected_indices = [idx for idx, _ in selected_batches]
+    selected_by_idx = {idx: batch for idx, batch in selected_batches}
+    donors: dict[int, tuple[int, dict[str, Any]]] = {}
+    if len(selected_batches) > 1:
+        for pos, idx in enumerate(selected_indices):
+            donor_idx = selected_indices[(pos + 1) % len(selected_indices)]
+            donors[idx] = (donor_idx, selected_by_idx[donor_idx])
+        return donors
+
+    only_idx = selected_indices[0]
+    for idx, item in enumerate(loader):
+        if idx != only_idx:
+            donors[only_idx] = (idx, item)
+            return donors
+    raise RuntimeError(
+        "E_zero_shuffled_token_trained_adapter requires at least two available dataset batches "
+        "so the motion token can come from a different batch."
+    )
+
+
+def build_token_override_for_variant(
+    model: torch.nn.Module,
+    variant_name: str,
+    batch: dict[str, Any],
+    device: torch.device,
+    donor_info: tuple[int, dict[str, Any]] | None = None,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    donor_batch = donor_info[1] if donor_info is not None else None
+    token, info = build_motion_token_override(model, variant_name, batch, device, donor_batch=donor_batch)
+    if donor_info is not None and info.get("motion_token_override") == "shuffled_gt":
+        info["token_source_batch_idx"] = donor_info[0]
+    if token is not None:
+        info["motion_token_shape"] = list(token.shape)
+    return token, info
 
 
 def load_model_for_variant(cfg: Any, adapter_ckpt: Path | None, device: torch.device) -> tuple[torch.nn.Module, bool]:
@@ -845,54 +958,77 @@ def compute_aggregate(per_batch_results: dict[int, dict[str, Any]]) -> dict[str,
             "r_pixel": mean_std([loss.get("r_pixel") for loss in losses]),
         }
 
+    def r_pixel(rows: dict[str, Any], variant: str) -> float | None:
+        value = rows.get(variant, {}).get("losses", {}).get("r_pixel")
+        return None if value is None else float(value)
+
     b_minus_c: list[float] = []
     b_minus_d: list[float] = []
     d_minus_c: list[float] = []
+    e_minus_c: list[float] = []
+    f_minus_c: list[float] = []
     rel_b_minus_c: list[float] = []
     rel_b_minus_d: list[float] = []
-    c_lt_b_count = 0
-    d_lt_b_count = 0
-    c_lt_d_count = 0
-    compared_bc = 0
-    compared_bd = 0
-    compared_cd = 0
+    counts = {
+        "c_lt_b": 0,
+        "d_lt_b": 0,
+        "c_lt_d": 0,
+        "c_lt_e": 0,
+        "c_lt_f": 0,
+    }
+    compared = {key: 0 for key in counts}
+
     for rows in per_batch_results.values():
-        b_val = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
-        c_val = rows.get("C_zero_gt_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
-        d_val = rows.get("D_zero_gt_token_random_adapter", {}).get("losses", {}).get("r_pixel")
-        b = None if b_val is None else float(b_val)
-        c = None if c_val is None else float(c_val)
-        d = None if d_val is None else float(d_val)
+        b = r_pixel(rows, "B_zero_no_token")
+        c = r_pixel(rows, "C_zero_gt_token_trained_adapter")
+        d = r_pixel(rows, "D_zero_gt_token_random_adapter")
+        e = r_pixel(rows, "E_zero_shuffled_token_trained_adapter")
+        f = r_pixel(rows, "F_zero_neutral_token_trained_adapter")
         if b is not None and c is not None:
             diff = b - c
             b_minus_c.append(diff)
             if b != 0.0:
                 rel_b_minus_c.append(diff / b)
-            c_lt_b_count += int(c < b)
-            compared_bc += 1
+            counts["c_lt_b"] += int(c < b)
+            compared["c_lt_b"] += 1
         if b is not None and d is not None:
             diff = b - d
             b_minus_d.append(diff)
             if b != 0.0:
                 rel_b_minus_d.append(diff / b)
-            d_lt_b_count += int(d < b)
-            compared_bd += 1
+            counts["d_lt_b"] += int(d < b)
+            compared["d_lt_b"] += 1
         if c is not None and d is not None:
             d_minus_c.append(d - c)
-            c_lt_d_count += int(c < d)
-            compared_cd += 1
+            counts["c_lt_d"] += int(c < d)
+            compared["c_lt_d"] += 1
+        if c is not None and e is not None:
+            e_minus_c.append(e - c)
+            counts["c_lt_e"] += int(c < e)
+            compared["c_lt_e"] += 1
+        if c is not None and f is not None:
+            f_minus_c.append(f - c)
+            counts["c_lt_f"] += int(c < f)
+            compared["c_lt_f"] += 1
+
     aggregate["improvement"] = {
         "b_minus_c_r_pixel": mean_std(b_minus_c),
         "relative_b_minus_c_over_b": mean_std(rel_b_minus_c),
         "b_minus_d_r_pixel": mean_std(b_minus_d),
         "relative_b_minus_d_over_b": mean_std(rel_b_minus_d),
         "d_minus_c_r_pixel": mean_std(d_minus_c),
-        "percent_batches_c_lt_b": None if compared_bc == 0 else c_lt_b_count / compared_bc,
-        "percent_batches_d_lt_b": None if compared_bd == 0 else d_lt_b_count / compared_bd,
-        "percent_batches_c_lt_d": None if compared_cd == 0 else c_lt_d_count / compared_cd,
-        "num_compared_batches_bc": compared_bc,
-        "num_compared_batches_bd": compared_bd,
-        "num_compared_batches_cd": compared_cd,
+        "e_minus_c_r_pixel": mean_std(e_minus_c),
+        "f_minus_c_r_pixel": mean_std(f_minus_c),
+        "percent_batches_c_lt_b": None if compared["c_lt_b"] == 0 else counts["c_lt_b"] / compared["c_lt_b"],
+        "percent_batches_d_lt_b": None if compared["d_lt_b"] == 0 else counts["d_lt_b"] / compared["d_lt_b"],
+        "percent_batches_c_lt_d": None if compared["c_lt_d"] == 0 else counts["c_lt_d"] / compared["c_lt_d"],
+        "percent_batches_c_lt_e": None if compared["c_lt_e"] == 0 else counts["c_lt_e"] / compared["c_lt_e"],
+        "percent_batches_c_lt_f": None if compared["c_lt_f"] == 0 else counts["c_lt_f"] / compared["c_lt_f"],
+        "num_compared_batches_bc": compared["c_lt_b"],
+        "num_compared_batches_bd": compared["d_lt_b"],
+        "num_compared_batches_cd": compared["c_lt_d"],
+        "num_compared_batches_ce": compared["c_lt_e"],
+        "num_compared_batches_cf": compared["c_lt_f"],
     }
     return aggregate
 
@@ -910,6 +1046,8 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
         "r_id",
         "adapter_loaded",
         "random_adapter",
+        "token_override",
+        "token_source_batch_idx",
         "images",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
@@ -928,6 +1066,8 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
                     "r_id": losses.get("r_id"),
                     "adapter_loaded": row.get("adapter_loaded", False),
                     "random_adapter": row.get("random_adapter", False),
+                    "token_override": row.get("token_override"),
+                    "token_source_batch_idx": row.get("token_source_batch_idx"),
                     "images": ";".join(row.get("images", [])),
                 })
     return path
@@ -953,17 +1093,25 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     per_batch_results = metrics.get("per_batch_results", {})
     variant_configs = metrics.get("variant_configs", {})
     improvement = aggregate.get("improvement", {})
+
+    def pct(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2%}"
+
     b_minus_c = improvement.get("b_minus_c_r_pixel", {})
     rel_bc = improvement.get("relative_b_minus_c_over_b", {})
     b_minus_d = improvement.get("b_minus_d_r_pixel", {})
     rel_bd = improvement.get("relative_b_minus_d_over_b", {})
     d_minus_c = improvement.get("d_minus_c_r_pixel", {})
+    e_minus_c = improvement.get("e_minus_c_r_pixel", {})
+    f_minus_c = improvement.get("f_minus_c_r_pixel", {})
     c_lt_b_pct = improvement.get("percent_batches_c_lt_b")
     d_lt_b_pct = improvement.get("percent_batches_d_lt_b")
     c_lt_d_pct = improvement.get("percent_batches_c_lt_d")
+    c_lt_e_pct = improvement.get("percent_batches_c_lt_e")
+    c_lt_f_pct = improvement.get("percent_batches_c_lt_f")
 
     lines = [
-        "# P9.2 Same-Batch A/B/C/D Evaluation",
+        "# P9.2 Same-Batch A/B/C/D/E/F Evaluation",
         "",
         "## Run Selection",
         f"* evaluation protocol: `{metrics.get('eval_protocol')}`",
@@ -984,13 +1132,13 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         f"* evaluated batch indices: `{metrics.get('evaluated_batch_indices')}`",
         "",
         "## Configs",
-        "| Variant | label | use_motion_token | zero_flame_motion | motion_token_source | adapter_loaded | random_adapter |",
-        "|---|---|---:|---:|---|---:|---:|",
+        "| Variant | label | use_motion_token | zero_flame_motion | motion_token_source | token_override | adapter_loaded | random_adapter |",
+        "|---|---|---:|---:|---|---|---:|---:|",
     ]
     for name, cfg in variant_configs.items():
         lines.append(
             f"| {name} | {cfg.get('label', '')} | {cfg.get('use_motion_token')} | {cfg.get('zero_flame_motion')} | "
-            f"{cfg.get('motion_token_source')} | {cfg.get('adapter_loaded', False)} | {cfg.get('random_adapter', False)} |"
+            f"{cfg.get('motion_token_source')} | {cfg.get('token_override')} | {cfg.get('adapter_loaded', False)} | {cfg.get('random_adapter', False)} |"
         )
 
     identities = metrics.get("batch_identities", [])
@@ -1015,9 +1163,6 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         f"* train_ids: `{metrics.get('train_ids_used_for_adapter')}`",
         f"* sacrificial_val_id: `{metrics.get('sacrificial_val_id')}`",
         f"* pass: `{metrics.get('identity_sanity_pass')}`",
-    ]
-
-    lines += [
         "",
         "## Image Grids",
         "| batch_idx | grid_path |",
@@ -1048,13 +1193,29 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         f"* B - D r_pixel mean/std: {fmt_float(b_minus_d.get('mean'))} / {fmt_float(b_minus_d.get('std'))}",
         f"* (B - D) / B mean/std: {fmt_float(rel_bd.get('mean'), 4)} / {fmt_float(rel_bd.get('std'), 4)}",
         f"* D - C r_pixel gap mean/std: {fmt_float(d_minus_c.get('mean'))} / {fmt_float(d_minus_c.get('std'))}",
-        f"* Percentage of batches where C < B: {'N/A' if c_lt_b_pct is None else f'{c_lt_b_pct:.2%}'}",
-        f"* Percentage of batches where D < B: {'N/A' if d_lt_b_pct is None else f'{d_lt_b_pct:.2%}'}",
-        f"* Percentage of batches where C < D: {'N/A' if c_lt_d_pct is None else f'{c_lt_d_pct:.2%}'}",
+        f"* E - C r_pixel gap mean/std: {fmt_float(e_minus_c.get('mean'))} / {fmt_float(e_minus_c.get('std'))}",
+        f"* F - C r_pixel gap mean/std: {fmt_float(f_minus_c.get('mean'))} / {fmt_float(f_minus_c.get('std'))}",
+        f"* Percentage of batches where C < B: {pct(c_lt_b_pct)}",
+        f"* Percentage of batches where D < B: {pct(d_lt_b_pct)}",
+        f"* Percentage of batches where C < D: {pct(c_lt_d_pct)}",
+        f"* Percentage of batches where C < E: {pct(c_lt_e_pct)}",
+        f"* Percentage of batches where C < F: {pct(c_lt_f_pct)}",
+        "",
+        "## Token Content Sanity Check",
+        f"* C correct-token beats E wrong-token: `{pct(c_lt_e_pct)}` of comparable batches.",
+        f"* C correct-token beats F zero-token: `{pct(c_lt_f_pct)}` of comparable batches.",
+    ]
+    if c_lt_e_pct is not None and c_lt_f_pct is not None:
+        if c_lt_e_pct > 0.5 and c_lt_f_pct > 0.5:
+            lines.append("* Correct GT token outperforms both wrong-token and zero-token controls on most batches, supporting token-content dependence.")
+        else:
+            lines.append("* Correct GT token does not consistently beat wrong/zero token controls; improvement may include generic adapter or appearance effects.")
+
+    lines += [
         "",
         "## Per-Batch Losses",
-        "| batch_idx | A r_pixel | B r_pixel | C r_pixel | D r_pixel | B-C | B-D | D-C | C < B | D < B | C < D |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| batch_idx | A r_pixel | B r_pixel | C r_pixel | D r_pixel | E r_pixel | F r_pixel | B-C | D-C | E-C | F-C | C < B | C < D | C < E | C < F |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for batch_idx in sorted(int(k) for k in per_batch_results.keys()):
         rows = per_batch_results[batch_idx]
@@ -1062,15 +1223,20 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         b = rows.get("B_zero_no_token", {}).get("losses", {}).get("r_pixel")
         c = rows.get("C_zero_gt_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
         d = rows.get("D_zero_gt_token_random_adapter", {}).get("losses", {}).get("r_pixel")
+        e = rows.get("E_zero_shuffled_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
+        f = rows.get("F_zero_neutral_token_trained_adapter", {}).get("losses", {}).get("r_pixel")
         bc = None if b is None or c is None else b - c
-        bd = None if b is None or d is None else b - d
         dc = None if d is None or c is None else d - c
+        ec = None if e is None or c is None else e - c
+        fc = None if f is None or c is None else f - c
         c_lt_b = c is not None and b is not None and c < b
-        d_lt_b = d is not None and b is not None and d < b
         c_lt_d = c is not None and d is not None and c < d
+        c_lt_e = c is not None and e is not None and c < e
+        c_lt_f = c is not None and f is not None and c < f
         lines.append(
             f"| {batch_idx} | {fmt_float(a)} | {fmt_float(b)} | {fmt_float(c)} | {fmt_float(d)} | "
-            f"{fmt_float(bc)} | {fmt_float(bd)} | {fmt_float(dc)} | {c_lt_b} | {d_lt_b} | {c_lt_d} |"
+            f"{fmt_float(e)} | {fmt_float(f)} | {fmt_float(bc)} | {fmt_float(dc)} | {fmt_float(ec)} | "
+            f"{fmt_float(fc)} | {c_lt_b} | {c_lt_d} | {c_lt_e} | {c_lt_f} |"
         )
 
     lines += [
@@ -1088,13 +1254,18 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
             lines.append("* C is better than random-adapter D on most batches, supporting that adapter training matters.")
         else:
             lines.append("* D is competitive with or better than C on many batches; diagnose whether token conditioning is too weak or the batch is out-of-distribution.")
+    if c_lt_e_pct is not None and c_lt_f_pct is not None:
+        if c_lt_e_pct > 0.5 and c_lt_f_pct > 0.5:
+            lines.append("* C also beats wrong-token E and zero-token F on most batches, supporting actual motion-token-content usage.")
+        else:
+            lines.append("* C does not reliably beat E/F token-content controls; inspect grids for appearance-correction artifacts.")
     if metrics.get("holdout_ids"):
         lines.append(f"* Holdout/train ID disjoint check: {metrics.get('holdout_train_ids_disjoint')}.")
     (output_dir / "comparison_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Strict same-batch P9.2 A/B/C/D no-grad evaluation.")
+    parser = argparse.ArgumentParser(description="Strict same-batch P9.2 A/B/C/D/E/F no-grad evaluation.")
     parser.add_argument("--base_config", type=Path, default=Path("configs/train/fastavatar_motion_zero_token_overfit_micro_render.yaml"))
     parser.add_argument("--local_paths_config", type=Path, default=Path("configs/local/p9_2_local_paths.yaml"))
     parser.add_argument("--adapter_ckpt", type=Path, default=Path("exps/checkpoints/fastavatar/fastavatar_motion_zero_token_overfit_micro_render_20step/000020/model.safetensors"))
@@ -1319,14 +1490,25 @@ def main() -> None:
                 save_image(gt_frame, gt_path)
                 grid_frames_by_batch[batch_idx]["GT"] = gt_frame
 
+    shuffled_token_donors = select_shuffled_token_donors(loader, selected_batches)
+    print(
+        "[P9.2ABC-EVAL] shuffled token donors="
+        + str({idx: donor_idx for idx, (donor_idx, _) in shuffled_token_donors.items()})
+    )
+
     for name in variants:
-        ckpt_for_variant = adapter_ckpt if name == "C_zero_gt_token_trained_adapter" and adapter_ckpt and adapter_ckpt.exists() else None
+        ckpt_for_variant = adapter_ckpt if name in TRAINED_ADAPTER_VARIANTS and adapter_ckpt and adapter_ckpt.exists() else None
         variant_cfg = make_variant_config(cfg, name, ckpt_for_variant)
         model, adapter_loaded = load_model_for_variant(variant_cfg, ckpt_for_variant, device)
         variant_configs[name] = {
             "use_motion_token": bool(variant_cfg.model.use_motion_token),
             "zero_flame_motion": bool(variant_cfg.model.zero_flame_motion),
             "motion_token_source": str(variant_cfg.model.motion_token_source),
+            "motion_token_eval_override": name in (
+                "E_zero_shuffled_token_trained_adapter",
+                "F_zero_neutral_token_trained_adapter",
+            ),
+            "token_override": TOKEN_OVERRIDE_BY_VARIANT.get(name, "none"),
             "adapter_loaded": adapter_loaded,
             "random_adapter": name == "D_zero_gt_token_random_adapter",
             "label": VARIANT_LABELS.get(name, name),
@@ -1335,8 +1517,14 @@ def main() -> None:
             batch = move_to_device(batch_cpu, device)
             if batch_idx not in batch_motion_summaries:
                 batch_motion_summaries[batch_idx] = flame_motion_summary(batch)
+            donor_info = shuffled_token_donors.get(batch_idx) if name == "E_zero_shuffled_token_trained_adapter" else None
             with torch.no_grad():
-                outputs, losses = forward_and_loss(model, variant_cfg, batch, device)
+                motion_token_input, token_info = build_token_override_for_variant(
+                    model, name, batch, device, donor_info=donor_info
+                )
+                outputs, losses = forward_and_loss(
+                    model, variant_cfg, batch, device, motion_token_input=motion_token_input
+                )
             if args.debug_output_shapes or os.environ.get("FASTAVATAR_TOKEN_DEBUG", "0") == "1":
                 print_output_debug_shapes(outputs, prefix=f"outputs.{name}.batch{batch_idx}")
             images: list[str] = []
@@ -1350,14 +1538,19 @@ def main() -> None:
                 "config": variant_configs[name],
                 "adapter_loaded": adapter_loaded,
                 "random_adapter": name == "D_zero_gt_token_random_adapter",
+                "token_override": token_info.get("motion_token_override"),
+                "token_source_batch_idx": token_info.get("token_source_batch_idx"),
+                "motion_token_shape": token_info.get("motion_token_shape"),
                 "losses": losses,
                 "images": images,
             }
             print(
                 f"[P9.2ABC-EVAL] batch={batch_idx} {name}: "
-                f"losses={losses} adapter_loaded={adapter_loaded} images={images}"
+                f"losses={losses} adapter_loaded={adapter_loaded} token_info={token_info} images={images}"
             )
             del outputs, batch
+            if motion_token_input is not None:
+                del motion_token_input
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         del model
