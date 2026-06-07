@@ -60,3 +60,6 @@ build/
 *.zip
 *.tar
 *.tar.gz
+
+# machine-local P9.2 path overrides
+configs/local/p9_2_local_paths.yaml
