@@ -83,7 +83,7 @@ def extract_uid(key: str) -> str:
     return key.split("/", 1)[0]
 
 
-def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_ids: list[str] | None = None) -> None:
+def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_ids: list[str] | None = None, max_ids: int = 6) -> None:
     cmd = [
         sys.executable,
         "scripts/debug/create_p9_2_overfit_metadata.py",
@@ -98,7 +98,7 @@ def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_id
         "--min_pairs",
         "auto",
         "--max_ids",
-        "6",
+        str(max_ids),
         "--max_items_per_id",
         "4",
     ]
@@ -133,14 +133,23 @@ def selected_ids_from_meta(meta_path: Path) -> list[str]:
     return sorted({extract_uid(k) for k in meta})
 
 
-def source_candidate_ids(source_meta: Path) -> list[str]:
-    with source_meta.open("r", encoding="utf-8") as f:
+def parse_id_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def filter_metadata_by_ids(src_meta: Path, output_meta: Path, include_ids: list[str]) -> tuple[Path, list[str], int]:
+    include = set(include_ids)
+    with src_meta.open("r", encoding="utf-8") as f:
         meta = json.load(f)
-    ids = set()
-    for key in meta:
-        if key.startswith("nersemble/"):
-            ids.add(extract_uid(key))
-    return sorted(ids)
+    filtered = {key: value for key, value in meta.items() if extract_uid(key) in include}
+    if not filtered:
+        raise RuntimeError(f"No metadata rows found for requested holdout_ids={include_ids} in {src_meta}")
+    output_meta.parent.mkdir(parents=True, exist_ok=True)
+    output_meta.write_text(json.dumps(filtered, ensure_ascii=False, indent=2), encoding="utf-8")
+    present_ids = sorted({extract_uid(key) for key in filtered})
+    return output_meta, present_ids, len(filtered)
 
 
 def write_resolved_config(base_config: Path, cfg: Any, paths: dict[str, Path | str], val_id: str, output_dir: Path) -> Path:
@@ -159,6 +168,30 @@ def write_resolved_config(base_config: Path, cfg: Any, paths: dict[str, Path | s
     return runtime_path
 
 
+def write_runtime_config_with_meta(
+    base_config: Path,
+    cfg: Any,
+    root_dir: Path,
+    meta_path: Path,
+    val_ids: list[str],
+    output_dir: Path,
+    suffix: str,
+) -> Path:
+    runtime_path = output_dir / "runtime_configs" / f"{base_config.stem}_{suffix}.yaml"
+    cfg = copy.deepcopy(cfg)
+    cfg.dataset.meta_path = str(meta_path)
+    cfg.dataset.datasets.nersemble.root_dir = str(root_dir)
+    cfg.dataset.datasets.nersemble.val_id = list(val_ids)
+    cfg.model.debug_skip_renderer = False
+    cfg.model.debug_latent_smoke_loss = False
+    cfg.model.debug_max_query_points = None
+    cfg.val.skip_eval = True
+    cfg.saver.auto_resume = False
+    cfg.saver.load_model = None
+    save_yaml(cfg, runtime_path)
+    return runtime_path
+
+
 VARIANTS = (
     "A_normal_no_token",
     "B_zero_no_token",
@@ -167,10 +200,10 @@ VARIANTS = (
 )
 
 VARIANT_LABELS = {
-    "A_normal_no_token": "A normal",
-    "B_zero_no_token": "B zero",
-    "C_zero_gt_token_trained_adapter": "C trained token",
-    "D_zero_gt_token_random_adapter": "D random token",
+    "A_normal_no_token": "A-normal",
+    "B_zero_no_token": "B-zero",
+    "C_zero_gt_token_trained_adapter": "C-trained-token",
+    "D_zero_gt_token_random_adapter": "D-random-token",
 }
 
 VARIANT_SHORT = {
@@ -245,96 +278,6 @@ def build_loader(cfg: Any, split: str) -> torch.utils.data.DataLoader:
         use_teeth=cfg_get(cfg.model, "add_teeth", True),
     )
     return torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
-
-
-def split_counts_for_val_id(cfg: Any, val_id: str) -> tuple[int, int]:
-    cfg = copy.deepcopy(cfg)
-    cfg.dataset.datasets.nersemble.val_id = [val_id]
-    train_loader = build_loader(cfg, "train")
-    val_loader = build_loader(cfg, "val")
-    return len(train_loader.dataset), len(val_loader.dataset)
-
-
-def find_valid_val_id_in_current_metadata(cfg: Any, selected_ids: list[str], preferred: str = "") -> tuple[str | None, dict[str, dict[str, int]]]:
-    candidates = []
-    if preferred and preferred in selected_ids:
-        candidates.append(preferred)
-    candidates.extend(uid for uid in selected_ids if uid not in set(candidates))
-    diagnostics: dict[str, dict[str, int]] = {}
-    for uid in candidates:
-        train_count, val_count = split_counts_for_val_id(cfg, uid)
-        diagnostics[uid] = {"train_count": train_count, "val_count": val_count}
-        print(f"[P9.2ABC-EVAL] val_id candidate={uid} train_count={train_count} val_count={val_count}")
-        if train_count > 0 and val_count > 0:
-            return uid, diagnostics
-    return None, diagnostics
-
-
-def resolve_valid_val_metadata(
-    base_config: Path,
-    base_cfg: Any,
-    paths: dict[str, Path | str],
-    output_dir: Path,
-) -> tuple[Path, Any, str, list[str], dict[str, dict[str, int]], dict[str, int]]:
-    """Generate metadata and choose a val_id that yields real val samples.
-
-    The metadata helper can select IDs that exist in metadata but produce an empty
-    FastAvatar validation split.  This routine verifies candidates by
-    instantiating the actual MixerDataset/NersembleDataset split before accepting
-    a val_id.
-    """
-    preferred = str(paths.get("preferred_val_id") or "")
-    generate_metadata(base_config, paths)
-    selected_ids = selected_ids_from_meta(Path(paths["generated_meta"]))
-    runtime_config = write_resolved_config(base_config, base_cfg, paths, selected_ids[-1], output_dir)
-    cfg = load_yaml(runtime_config)
-    val_id, diagnostics = find_valid_val_id_in_current_metadata(cfg, selected_ids, preferred)
-    if val_id is None:
-        print(
-            f"[P9.2ABC-EVAL][WARN] No generated metadata ID produced a non-empty val split. "
-            f"selected_ids={selected_ids}; searching source metadata IDs."
-        )
-        source_ids = source_candidate_ids(Path(paths["source_meta"]))
-        ordered_source_ids = []
-        if preferred and preferred in source_ids:
-            ordered_source_ids.append(preferred)
-        ordered_source_ids.extend(uid for uid in source_ids if uid not in set(ordered_source_ids))
-        for candidate in ordered_source_ids:
-            prefer_ids = [candidate] + [uid for uid in selected_ids if uid != candidate]
-            try:
-                generate_metadata(base_config, paths, prefer_ids=prefer_ids)
-            except Exception as exc:
-                print(f"[P9.2ABC-EVAL][WARN] Metadata generation failed for val candidate={candidate}: {exc}")
-                continue
-            selected_ids = selected_ids_from_meta(Path(paths["generated_meta"]))
-            if candidate not in selected_ids:
-                continue
-            runtime_config = write_resolved_config(base_config, base_cfg, paths, candidate, output_dir)
-            cfg = load_yaml(runtime_config)
-            val_id, candidate_diag = find_valid_val_id_in_current_metadata(cfg, selected_ids, candidate)
-            diagnostics.update(candidate_diag)
-            if val_id is not None:
-                break
-
-    if val_id is None:
-        raise RuntimeError(
-            "Could not find any val_id with non-empty train and val splits. "
-            f"generated_meta={paths['generated_meta']}, source_meta={paths['source_meta']}, diagnostics={diagnostics}"
-        )
-    runtime_config = write_resolved_config(base_config, base_cfg, paths, val_id, output_dir)
-    cfg = load_yaml(runtime_config)
-    train_loader = build_loader(cfg, "train")
-    val_loader = build_loader(cfg, "val")
-    split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
-    if split_counts["train"] <= 0 or split_counts["val"] <= 0:
-        raise RuntimeError(
-            f"Resolved val_id={val_id} failed final split validation: split_counts={split_counts}, selected_ids={selected_ids}"
-        )
-    train_ids = [uid for uid in selected_ids if uid != val_id]
-    print(f"[P9.2ABC-EVAL] selected_train_ids={train_ids}")
-    print(f"[P9.2ABC-EVAL] selected_val_id={val_id}")
-    print(f"[P9.2ABC-EVAL] verified split_counts={split_counts}")
-    return runtime_config, cfg, val_id, selected_ids, diagnostics, split_counts
 
 
 def move_to_device(obj: Any, device: torch.device) -> Any:
@@ -732,10 +675,11 @@ def _first_existing(batch: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
-def extract_batch_identity(batch: dict[str, Any], split: str, batch_idx: int) -> dict[str, Any]:
+def extract_batch_identity(batch: dict[str, Any], split: str, eval_protocol: str, batch_idx: int) -> dict[str, Any]:
     uid = _first_existing(batch, ("uid", "uids", "subject_id", "identity_id", "id"))
     return {
         "split": split,
+        "eval_protocol": eval_protocol,
         "batch_idx": batch_idx,
         "uid": uid,
         "subject_id": _first_existing(batch, ("subject_id", "identity_id", "id")) or uid,
@@ -755,6 +699,7 @@ def write_batch_identity_files(identities: list[dict[str, Any]], output_dir: Pat
     json_path.write_text(json.dumps(json_safe(identities), ensure_ascii=False, indent=2), encoding="utf-8")
     fieldnames = [
         "split",
+        "eval_protocol",
         "batch_idx",
         "uid",
         "subject_id",
@@ -919,10 +864,14 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         "# P9.2 Same-Batch A/B/C/D Evaluation",
         "",
         "## Run Selection",
+        f"* evaluation protocol: `{metrics.get('eval_protocol')}`",
         f"* requested split: `{metrics.get('requested_split')}`",
         f"* evaluated split: `{metrics.get('split')}`",
         f"* allow_fallback_to_train: `{metrics.get('allow_fallback_to_train')}`",
         f"* split counts: `{metrics.get('split_counts')}`",
+        f"* train IDs used for adapter: `{metrics.get('train_ids_used_for_adapter')}`",
+        f"* holdout IDs: `{metrics.get('holdout_ids')}`",
+        f"* holdout/train disjoint: `{metrics.get('holdout_train_ids_disjoint')}`",
         f"* selected_ids: `{metrics.get('selected_ids')}`",
         f"* val_id: `{metrics.get('val_id')}`",
         f"* batch_idx start: `{metrics.get('batch_idx')}`",
@@ -943,12 +892,12 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     lines += [
         "",
         "## Evaluated Samples",
-        "| split | batch_idx | uid | subject_id | frame_id | metadata_key | source_image_path | target_image_path |",
-        "|---|---:|---|---|---|---|---|---|",
+        "| split | eval_protocol | batch_idx | uid | subject_id | frame_id | metadata_key | source_image_path | target_image_path |",
+        "|---|---|---:|---|---|---|---|---|---|",
     ]
     for identity in identities:
         lines.append(
-            f"| {identity.get('split')} | {identity.get('batch_idx')} | {identity.get('uid')} | "
+            f"| {identity.get('split')} | {identity.get('eval_protocol')} | {identity.get('batch_idx')} | {identity.get('uid')} | "
             f"{identity.get('subject_id')} | {identity.get('frame_id')} | {identity.get('metadata_key')} | "
             f"{identity.get('source_image_path')} | {identity.get('target_image_path')} |"
         )
@@ -1024,6 +973,8 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
             lines.append("* C is better than random-adapter D on most batches, supporting that adapter training matters.")
         else:
             lines.append("* D is competitive with or better than C on many batches; diagnose whether token conditioning is too weak or the batch is out-of-distribution.")
+    if metrics.get("holdout_ids"):
+        lines.append(f"* Holdout/train ID disjoint check: {metrics.get('holdout_train_ids_disjoint')}.")
     (output_dir / "comparison_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1033,7 +984,10 @@ def main() -> None:
     parser.add_argument("--local_paths_config", type=Path, default=Path("configs/local/p9_2_local_paths.yaml"))
     parser.add_argument("--adapter_ckpt", type=Path, default=Path("exps/checkpoints/fastavatar/fastavatar_motion_zero_token_overfit_micro_render_20step/000020/model.safetensors"))
     parser.add_argument("--output_dir", type=Path, default=Path("outputs/mmhead_debug/p9_2_abc_eval"))
-    parser.add_argument("--split", choices=("val", "train"), default="val")
+    parser.add_argument("--split", choices=("val", "train", "holdout"), default="val")
+    parser.add_argument("--holdout_ids", default="083", help="Comma-separated IDs for holdout train-style no-grad evaluation.")
+    parser.add_argument("--train_ids", default="030,037,038,069,070", help="Comma-separated adapter-training IDs for disjointness/reporting checks.")
+    parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle"), default=None)
     parser.add_argument("--batch_idx", "--batch_index", dest="batch_idx", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
@@ -1053,43 +1007,84 @@ def main() -> None:
 
     base_cfg = load_yaml(base_config)
     paths = resolve_local_paths(base_cfg, repo, local_paths_config)
-    runtime_config, cfg, val_id, selected_ids, val_id_diagnostics, verified_split_counts = resolve_valid_val_metadata(
-        base_config,
-        base_cfg,
-        paths,
-        output_dir,
-    )
+    train_ids = parse_id_list(args.train_ids)
+    holdout_ids = parse_id_list(args.holdout_ids)
+    overlap = sorted(set(train_ids) & set(holdout_ids))
+    if overlap:
+        raise RuntimeError(f"holdout_ids must be disjoint from train_ids; overlap={overlap}")
+    holdout_train_ids_disjoint = True
+    requested_protocol = args.eval_protocol or ("holdout_trainstyle" if args.split == "holdout" else "native_val")
+    if args.split == "holdout" and requested_protocol != "holdout_trainstyle":
+        raise RuntimeError("--split holdout requires --eval_protocol holdout_trainstyle or an omitted --eval_protocol")
+    if requested_protocol == "holdout_trainstyle" and args.split != "holdout":
+        raise RuntimeError("--eval_protocol holdout_trainstyle requires --split holdout")
+
+    val_id_diagnostics: dict[str, dict[str, int]] = {}
+    selected_ids: list[str]
+    val_id = ""
+    if requested_protocol == "holdout_trainstyle":
+        if not holdout_ids:
+            raise RuntimeError("--split holdout requires at least one --holdout_ids value")
+        prefer_ids = train_ids + [uid for uid in holdout_ids if uid not in set(train_ids)]
+        generate_metadata(base_config, paths, prefer_ids=prefer_ids, max_ids=max(6, len(prefer_ids)))
+        generated_meta = Path(paths["generated_meta"])
+        holdout_meta = output_dir / "runtime_configs" / "holdout_eval_mixed_uids.json"
+        holdout_meta, selected_ids, holdout_item_count = filter_metadata_by_ids(generated_meta, holdout_meta, holdout_ids)
+        runtime_config = write_runtime_config_with_meta(
+            base_config,
+            base_cfg,
+            Path(paths["root_dir"]),
+            holdout_meta,
+            val_ids=[],
+            output_dir=output_dir,
+            suffix="holdout_trainstyle_resolved",
+        )
+        cfg = load_yaml(runtime_config)
+        loader = build_loader(cfg, "train")
+        actual_split = "holdout"
+        split_counts = {"holdout": len(loader.dataset), "train_style_loader": len(loader.dataset), "native_val": 0}
+        if len(loader.dataset) <= 0:
+            raise RuntimeError(
+                f"Holdout train-style evaluation produced zero samples. holdout_ids={holdout_ids}, "
+                f"holdout_meta={holdout_meta}, holdout_item_count={holdout_item_count}"
+            )
+        print("[P9.2ABC-EVAL] eval_protocol=holdout_trainstyle")
+        print(f"[P9.2ABC-EVAL] holdout_ids={holdout_ids}")
+        print(f"[P9.2ABC-EVAL] train_ids_used_for_adapter={train_ids}")
+        print(f"[P9.2ABC-EVAL] eval_count={len(loader.dataset)}")
+    else:
+        generate_metadata(base_config, paths)
+        val_id, selected_ids = choose_val_id(Path(paths["generated_meta"]), str(paths["preferred_val_id"]))
+        runtime_config = write_resolved_config(base_config, base_cfg, paths, val_id, output_dir)
+        cfg = load_yaml(runtime_config)
+        train_loader = build_loader(cfg, "train")
+        val_loader = build_loader(cfg, "val")
+        loaders = {"train": train_loader, "val": val_loader}
+        split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
+        print("[P9.2ABC-EVAL] eval_protocol=native_val")
+        print(f"[P9.2ABC-EVAL] split_counts={split_counts} requested_split={args.split}")
+        actual_split = args.split
+        loader = loaders[actual_split]
+        if len(loader.dataset) == 0:
+            error = (
+                f"Requested split={args.split} has zero samples. selected_ids={selected_ids}, "
+                f"val_id={val_id}, train_count={split_counts['train']}, val_count={split_counts['val']}."
+            )
+            if args.split == "val" and args.allow_fallback_to_train:
+                print(f"[P9.2ABC-EVAL][WARN] {error} Explicit --allow_fallback_to_train enabled; using train split.")
+                actual_split = "train"
+                loader = train_loader
+            else:
+                raise RuntimeError(error + " Refusing silent fallback; pass --allow_fallback_to_train to evaluate train intentionally.")
+        if len(loader.dataset) == 0:
+            raise RuntimeError(
+                f"No samples available for same-batch evaluation after split resolution. "
+                f"selected_ids={selected_ids}, val_id={val_id}, split_counts={split_counts}"
+            )
 
     print(f"[P9.2ABC-EVAL] runtime_config={runtime_config}")
     print(f"[P9.2ABC-EVAL] selected_ids={selected_ids} val_id={val_id}")
     print(f"[P9.2ABC-EVAL] device={device}")
-
-    train_loader = build_loader(cfg, "train")
-    val_loader = build_loader(cfg, "val")
-    loaders = {"train": train_loader, "val": val_loader}
-    split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
-    if split_counts != verified_split_counts:
-        print(f"[P9.2ABC-EVAL][WARN] split counts changed after verification: verified={verified_split_counts} current={split_counts}")
-    print(f"[P9.2ABC-EVAL] split_counts={split_counts} requested_split={args.split}")
-
-    actual_split = args.split
-    loader = loaders[actual_split]
-    if len(loader.dataset) == 0:
-        error = (
-            f"Requested split={args.split} has zero samples. selected_ids={selected_ids}, "
-            f"val_id={val_id}, train_count={split_counts['train']}, val_count={split_counts['val']}."
-        )
-        if args.split == "val" and args.allow_fallback_to_train:
-            print(f"[P9.2ABC-EVAL][WARN] {error} Explicit --allow_fallback_to_train enabled; using train split.")
-            actual_split = "train"
-            loader = train_loader
-        else:
-            raise RuntimeError(error + " Refusing silent fallback; pass --allow_fallback_to_train to evaluate train intentionally.")
-    if len(loader.dataset) == 0:
-        raise RuntimeError(
-            f"No samples available for same-batch evaluation after split resolution. "
-            f"selected_ids={selected_ids}, val_id={val_id}, split_counts={split_counts}"
-        )
 
     selected_batches: list[tuple[int, dict[str, Any]]] = []
     stop_after = args.batch_idx + args.num_batches
@@ -1178,7 +1173,7 @@ def main() -> None:
         for batch_idx, frames in grid_frames_by_batch.items():
             image_grids[batch_idx] = save_labeled_eval_grid(frames, grid_dir / f"batch_{batch_idx:03d}_grid.png")
 
-    batch_identities = [extract_batch_identity(batch, actual_split, idx) for idx, batch in selected_batches]
+    batch_identities = [extract_batch_identity(batch, actual_split, requested_protocol, idx) for idx, batch in selected_batches]
     identity_json_path, identity_csv_path = write_batch_identity_files(batch_identities, output_dir)
     aggregate = compute_aggregate(per_batch_results)
     csv_path = write_per_batch_csv(per_batch_results, output_dir)
@@ -1189,8 +1184,12 @@ def main() -> None:
         "output_dir": output_dir,
         "selected_ids": selected_ids,
         "val_id": val_id,
+        "eval_protocol": requested_protocol,
         "requested_split": args.split,
         "split": actual_split,
+        "train_ids_used_for_adapter": train_ids,
+        "holdout_ids": holdout_ids,
+        "holdout_train_ids_disjoint": holdout_train_ids_disjoint,
         "allow_fallback_to_train": bool(args.allow_fallback_to_train),
         "split_counts": split_counts,
         "val_id_diagnostics": val_id_diagnostics,
