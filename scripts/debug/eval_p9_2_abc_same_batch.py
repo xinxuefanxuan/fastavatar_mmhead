@@ -719,6 +719,37 @@ def write_batch_identity_files(identities: list[dict[str, Any]], output_dir: Pat
     return json_path, csv_path
 
 
+def _collect_identity_strings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_collect_identity_strings(item))
+        return out
+    if isinstance(value, dict):
+        out: list[str] = []
+        for item in value.values():
+            out.extend(_collect_identity_strings(item))
+        return out
+    return [str(value)]
+
+
+def evaluated_uids_from_identities(identities: list[dict[str, Any]]) -> list[str]:
+    ids: set[str] = set()
+    for identity in identities:
+        for field in ("uid", "subject_id", "metadata_key"):
+            for value in _collect_identity_strings(identity.get(field)):
+                value = value.strip()
+                if value:
+                    ids.add(extract_uid(value))
+    return sorted(ids)
+
+
 def mean_std(values: list[float]) -> dict[str, float | None]:
     finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     if not finite:
@@ -872,6 +903,9 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
         f"* split counts: `{metrics.get('split_counts')}`",
         f"* train IDs used for adapter: `{metrics.get('train_ids_used_for_adapter')}`",
         f"* holdout IDs: `{metrics.get('holdout_ids')}`",
+        f"* sacrificial val ID: `{metrics.get('sacrificial_val_id')}`",
+        f"* metadata IDs: `{metrics.get('metadata_ids')}`",
+        f"* evaluated UIDs: `{metrics.get('evaluated_uids')}`",
         f"* holdout/train disjoint: `{metrics.get('holdout_train_ids_disjoint')}`",
         f"* selected_ids: `{metrics.get('selected_ids')}`",
         f"* val_id: `{metrics.get('val_id')}`",
@@ -988,7 +1022,8 @@ def main() -> None:
     parser.add_argument("--split", choices=("val", "train", "holdout"), default="val")
     parser.add_argument("--holdout_ids", default="083", help="Comma-separated IDs for holdout train-style no-grad evaluation.")
     parser.add_argument("--train_ids", default="030,037,038,069,070", help="Comma-separated adapter-training IDs for disjointness/reporting checks.")
-    parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle", "holdout_trainstyle_no_val_exclusion"), default=None)
+    parser.add_argument("--sacrificial_val_id", default=None, help="Train ID to include in holdout metadata and exclude via val_id for train-style holdout eval.")
+    parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle", "holdout_trainstyle_no_val_exclusion", "holdout_trainstyle_sacrificial_val"), default=None)
     parser.add_argument("--batch_idx", "--batch_index", dest="batch_idx", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
@@ -1014,34 +1049,53 @@ def main() -> None:
     if overlap:
         raise RuntimeError(f"holdout_ids must be disjoint from train_ids; overlap={overlap}")
     holdout_train_ids_disjoint = True
-    requested_protocol = args.eval_protocol or ("holdout_trainstyle_no_val_exclusion" if args.split == "holdout" else "native_val")
-    if args.split == "holdout" and requested_protocol not in ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion"):
-        raise RuntimeError("--split holdout requires --eval_protocol holdout_trainstyle_no_val_exclusion or an omitted --eval_protocol")
-    if requested_protocol in ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion") and args.split != "holdout":
+    requested_protocol = args.eval_protocol or ("holdout_trainstyle_sacrificial_val" if args.split == "holdout" else "native_val")
+    holdout_protocols = ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion", "holdout_trainstyle_sacrificial_val")
+    if args.split == "holdout" and requested_protocol not in holdout_protocols:
+        raise RuntimeError("--split holdout requires --eval_protocol holdout_trainstyle_sacrificial_val or an omitted --eval_protocol")
+    if requested_protocol in holdout_protocols and args.split != "holdout":
         raise RuntimeError("holdout train-style eval protocols require --split holdout")
-    if requested_protocol == "holdout_trainstyle":
-        print("[P9.2ABC-EVAL][WARN] eval_protocol=holdout_trainstyle is an alias; using holdout_trainstyle_no_val_exclusion.")
-        requested_protocol = "holdout_trainstyle_no_val_exclusion"
+    if requested_protocol in ("holdout_trainstyle", "holdout_trainstyle_no_val_exclusion"):
+        print(f"[P9.2ABC-EVAL][WARN] eval_protocol={requested_protocol} is an alias; using holdout_trainstyle_sacrificial_val.")
+        requested_protocol = "holdout_trainstyle_sacrificial_val"
 
     val_id_diagnostics: dict[str, dict[str, int]] = {}
     selected_ids: list[str]
     val_id = ""
-    if requested_protocol == "holdout_trainstyle_no_val_exclusion":
+    sacrificial_val_id = ""
+    metadata_ids: list[str] = []
+    evaluated_uids: list[str] = []
+    if requested_protocol == "holdout_trainstyle_sacrificial_val":
         if not holdout_ids:
             raise RuntimeError("--split holdout requires at least one --holdout_ids value")
-        prefer_ids = train_ids + [uid for uid in holdout_ids if uid not in set(train_ids)]
+        sacrificial_val_id = str(args.sacrificial_val_id or "")
+        if not sacrificial_val_id:
+            sacrificial_candidates = [uid for uid in train_ids if uid not in set(holdout_ids)]
+            if not sacrificial_candidates:
+                raise RuntimeError("Could not choose sacrificial_val_id: train_ids is empty or overlaps all holdout_ids")
+            sacrificial_val_id = sacrificial_candidates[0]
+        elif sacrificial_val_id not in set(train_ids):
+            raise RuntimeError(f"sacrificial_val_id={sacrificial_val_id} must come from train_ids={train_ids}")
+        if sacrificial_val_id in set(holdout_ids):
+            raise RuntimeError(f"sacrificial_val_id={sacrificial_val_id} must not be in holdout_ids={holdout_ids}")
+        metadata_requested_ids = list(dict.fromkeys(holdout_ids + [sacrificial_val_id]))
+        prefer_ids = train_ids + [uid for uid in metadata_requested_ids if uid not in set(train_ids)]
         generate_metadata(base_config, paths, prefer_ids=prefer_ids, max_ids=max(6, len(prefer_ids)))
         generated_meta = Path(paths["generated_meta"])
         holdout_meta = output_dir / "runtime_configs" / "holdout_eval_mixed_uids.json"
-        holdout_meta, selected_ids, holdout_item_count = filter_metadata_by_ids(generated_meta, holdout_meta, holdout_ids)
+        holdout_meta, selected_ids, holdout_item_count = filter_metadata_by_ids(generated_meta, holdout_meta, metadata_requested_ids)
+        metadata_ids = list(selected_ids)
+        missing_metadata_ids = sorted(set(metadata_requested_ids) - set(metadata_ids))
+        if missing_metadata_ids:
+            raise RuntimeError(f"Holdout metadata is missing requested IDs: {missing_metadata_ids}; metadata_ids={metadata_ids}")
         runtime_config = write_runtime_config_with_meta(
             base_config,
             base_cfg,
             Path(paths["root_dir"]),
             holdout_meta,
-            val_ids=[],
+            val_ids=[sacrificial_val_id],
             output_dir=output_dir,
-            suffix="holdout_trainstyle_no_val_exclusion_resolved",
+            suffix="holdout_trainstyle_sacrificial_val_resolved",
         )
         cfg = load_yaml(runtime_config)
         loader = build_loader(cfg, "train")
@@ -1049,12 +1103,12 @@ def main() -> None:
         holdout_dataset_len = len(loader.dataset)
         nersemble_val_id = list(cfg.dataset.datasets.nersemble.val_id)
         val_num = int(cfg.dataset.val_num)
-        validation_exclusion_disabled = val_num == 0 and len(nersemble_val_id) == 0
+        validation_exclusion_disabled = val_num == 0 and nersemble_val_id == [sacrificial_val_id]
         split_counts = {"holdout": holdout_dataset_len, "train_style_loader": holdout_dataset_len, "native_val": 0}
         if not validation_exclusion_disabled:
             raise RuntimeError(
-                f"Holdout train-style evaluation must disable validation exclusion, but got "
-                f"dataset.val_num={val_num}, nersemble.val_id={nersemble_val_id}"
+                f"Holdout train-style evaluation expected sacrificial validation exclusion only, but got "
+                f"dataset.val_num={val_num}, nersemble.val_id={nersemble_val_id}, sacrificial_val_id={sacrificial_val_id}"
             )
         if holdout_item_count <= 0:
             raise RuntimeError(f"Holdout metadata is empty. holdout_ids={holdout_ids}, holdout_meta={holdout_meta}")
@@ -1065,8 +1119,11 @@ def main() -> None:
                 f"dataset.val_num={val_num}, nersemble.val_id={nersemble_val_id}, "
                 f"validation_exclusion_disabled={validation_exclusion_disabled}"
             )
-        print("[P9.2ABC-EVAL] eval_protocol=holdout_trainstyle_no_val_exclusion")
+        print("[P9.2ABC-EVAL] eval_protocol=holdout_trainstyle_sacrificial_val")
+        print(f"[P9.2ABC-EVAL] train_ids={train_ids}")
         print(f"[P9.2ABC-EVAL] holdout_ids={holdout_ids}")
+        print(f"[P9.2ABC-EVAL] sacrificial_val_id={sacrificial_val_id}")
+        print(f"[P9.2ABC-EVAL] metadata_ids={metadata_ids}")
         print(f"[P9.2ABC-EVAL] holdout_metadata_path={holdout_meta}")
         print(f"[P9.2ABC-EVAL] holdout_item_count={holdout_item_count}")
         print(f"[P9.2ABC-EVAL] dataset.val_num={val_num}")
@@ -1122,6 +1179,29 @@ def main() -> None:
             f"Could not fetch any batches for batch_idx={args.batch_idx}, "
             f"num_batches={args.num_batches}; split={actual_split}; dataset size={len(loader.dataset)}"
         )
+
+    batch_identities = [extract_batch_identity(batch, actual_split, requested_protocol, idx) for idx, batch in selected_batches]
+    evaluated_uids = evaluated_uids_from_identities(batch_identities)
+    if requested_protocol == "holdout_trainstyle_sacrificial_val":
+        if not evaluated_uids:
+            raise RuntimeError("Could not verify holdout evaluated_uids from selected batch identities.")
+        outside_holdout = sorted(set(evaluated_uids) - set(holdout_ids))
+        if outside_holdout:
+            raise RuntimeError(
+                f"Holdout eval produced sample IDs outside holdout_ids. evaluated_uids={evaluated_uids}, "
+                f"holdout_ids={holdout_ids}, outside_holdout={outside_holdout}"
+            )
+        if sacrificial_val_id in set(evaluated_uids):
+            raise RuntimeError(
+                f"Holdout eval leaked sacrificial_val_id={sacrificial_val_id} into evaluated_uids={evaluated_uids}"
+            )
+        leaked_train_ids = sorted(set(evaluated_uids) & set(train_ids))
+        if leaked_train_ids:
+            raise RuntimeError(
+                f"Holdout eval leaked adapter-training IDs into evaluated_uids. leaked_train_ids={leaked_train_ids}, "
+                f"train_ids={train_ids}, holdout_ids={holdout_ids}"
+            )
+        print(f"[P9.2ABC-EVAL] evaluated_uids={evaluated_uids}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     image_dir = output_dir / "images"
@@ -1196,7 +1276,6 @@ def main() -> None:
         for batch_idx, frames in grid_frames_by_batch.items():
             image_grids[batch_idx] = save_labeled_eval_grid(frames, grid_dir / f"batch_{batch_idx:03d}_grid.png")
 
-    batch_identities = [extract_batch_identity(batch, actual_split, requested_protocol, idx) for idx, batch in selected_batches]
     identity_json_path, identity_csv_path = write_batch_identity_files(batch_identities, output_dir)
     aggregate = compute_aggregate(per_batch_results)
     csv_path = write_per_batch_csv(per_batch_results, output_dir)
@@ -1212,6 +1291,9 @@ def main() -> None:
         "split": actual_split,
         "train_ids_used_for_adapter": train_ids,
         "holdout_ids": holdout_ids,
+        "sacrificial_val_id": sacrificial_val_id,
+        "metadata_ids": metadata_ids,
+        "evaluated_uids": evaluated_uids,
         "holdout_train_ids_disjoint": holdout_train_ids_disjoint,
         "allow_fallback_to_train": bool(args.allow_fallback_to_train),
         "split_counts": split_counts,
