@@ -83,7 +83,7 @@ def extract_uid(key: str) -> str:
     return key.split("/", 1)[0]
 
 
-def generate_metadata(base_config: Path, paths: dict[str, Path | str]) -> None:
+def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_ids: list[str] | None = None) -> None:
     cmd = [
         sys.executable,
         "scripts/debug/create_p9_2_overfit_metadata.py",
@@ -102,6 +102,8 @@ def generate_metadata(base_config: Path, paths: dict[str, Path | str]) -> None:
         "--max_items_per_id",
         "4",
     ]
+    if prefer_ids:
+        cmd.extend(["--prefer_ids", ",".join(prefer_ids)])
     print("[P9.2ABC-EVAL] generate metadata:", " ".join(shlex.quote(x) for x in cmd))
     subprocess.run(cmd, check=True)
 
@@ -123,6 +125,22 @@ def choose_val_id(meta_path: Path, preferred: str) -> tuple[str, list[str]]:
     if not train_ids:
         raise RuntimeError(f"Chosen val_id={val_id} leaves zero train IDs from selected IDs={ids}")
     return val_id, ids
+
+
+def selected_ids_from_meta(meta_path: Path) -> list[str]:
+    with meta_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+    return sorted({extract_uid(k) for k in meta})
+
+
+def source_candidate_ids(source_meta: Path) -> list[str]:
+    with source_meta.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+    ids = set()
+    for key in meta:
+        if key.startswith("nersemble/"):
+            ids.add(extract_uid(key))
+    return sorted(ids)
 
 
 def write_resolved_config(base_config: Path, cfg: Any, paths: dict[str, Path | str], val_id: str, output_dir: Path) -> Path:
@@ -227,6 +245,96 @@ def build_loader(cfg: Any, split: str) -> torch.utils.data.DataLoader:
         use_teeth=cfg_get(cfg.model, "add_teeth", True),
     )
     return torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, drop_last=False)
+
+
+def split_counts_for_val_id(cfg: Any, val_id: str) -> tuple[int, int]:
+    cfg = copy.deepcopy(cfg)
+    cfg.dataset.datasets.nersemble.val_id = [val_id]
+    train_loader = build_loader(cfg, "train")
+    val_loader = build_loader(cfg, "val")
+    return len(train_loader.dataset), len(val_loader.dataset)
+
+
+def find_valid_val_id_in_current_metadata(cfg: Any, selected_ids: list[str], preferred: str = "") -> tuple[str | None, dict[str, dict[str, int]]]:
+    candidates = []
+    if preferred and preferred in selected_ids:
+        candidates.append(preferred)
+    candidates.extend(uid for uid in selected_ids if uid not in set(candidates))
+    diagnostics: dict[str, dict[str, int]] = {}
+    for uid in candidates:
+        train_count, val_count = split_counts_for_val_id(cfg, uid)
+        diagnostics[uid] = {"train_count": train_count, "val_count": val_count}
+        print(f"[P9.2ABC-EVAL] val_id candidate={uid} train_count={train_count} val_count={val_count}")
+        if train_count > 0 and val_count > 0:
+            return uid, diagnostics
+    return None, diagnostics
+
+
+def resolve_valid_val_metadata(
+    base_config: Path,
+    base_cfg: Any,
+    paths: dict[str, Path | str],
+    output_dir: Path,
+) -> tuple[Path, Any, str, list[str], dict[str, dict[str, int]], dict[str, int]]:
+    """Generate metadata and choose a val_id that yields real val samples.
+
+    The metadata helper can select IDs that exist in metadata but produce an empty
+    FastAvatar validation split.  This routine verifies candidates by
+    instantiating the actual MixerDataset/NersembleDataset split before accepting
+    a val_id.
+    """
+    preferred = str(paths.get("preferred_val_id") or "")
+    generate_metadata(base_config, paths)
+    selected_ids = selected_ids_from_meta(Path(paths["generated_meta"]))
+    runtime_config = write_resolved_config(base_config, base_cfg, paths, selected_ids[-1], output_dir)
+    cfg = load_yaml(runtime_config)
+    val_id, diagnostics = find_valid_val_id_in_current_metadata(cfg, selected_ids, preferred)
+    if val_id is None:
+        print(
+            f"[P9.2ABC-EVAL][WARN] No generated metadata ID produced a non-empty val split. "
+            f"selected_ids={selected_ids}; searching source metadata IDs."
+        )
+        source_ids = source_candidate_ids(Path(paths["source_meta"]))
+        ordered_source_ids = []
+        if preferred and preferred in source_ids:
+            ordered_source_ids.append(preferred)
+        ordered_source_ids.extend(uid for uid in source_ids if uid not in set(ordered_source_ids))
+        for candidate in ordered_source_ids:
+            prefer_ids = [candidate] + [uid for uid in selected_ids if uid != candidate]
+            try:
+                generate_metadata(base_config, paths, prefer_ids=prefer_ids)
+            except Exception as exc:
+                print(f"[P9.2ABC-EVAL][WARN] Metadata generation failed for val candidate={candidate}: {exc}")
+                continue
+            selected_ids = selected_ids_from_meta(Path(paths["generated_meta"]))
+            if candidate not in selected_ids:
+                continue
+            runtime_config = write_resolved_config(base_config, base_cfg, paths, candidate, output_dir)
+            cfg = load_yaml(runtime_config)
+            val_id, candidate_diag = find_valid_val_id_in_current_metadata(cfg, selected_ids, candidate)
+            diagnostics.update(candidate_diag)
+            if val_id is not None:
+                break
+
+    if val_id is None:
+        raise RuntimeError(
+            "Could not find any val_id with non-empty train and val splits. "
+            f"generated_meta={paths['generated_meta']}, source_meta={paths['source_meta']}, diagnostics={diagnostics}"
+        )
+    runtime_config = write_resolved_config(base_config, base_cfg, paths, val_id, output_dir)
+    cfg = load_yaml(runtime_config)
+    train_loader = build_loader(cfg, "train")
+    val_loader = build_loader(cfg, "val")
+    split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
+    if split_counts["train"] <= 0 or split_counts["val"] <= 0:
+        raise RuntimeError(
+            f"Resolved val_id={val_id} failed final split validation: split_counts={split_counts}, selected_ids={selected_ids}"
+        )
+    train_ids = [uid for uid in selected_ids if uid != val_id]
+    print(f"[P9.2ABC-EVAL] selected_train_ids={train_ids}")
+    print(f"[P9.2ABC-EVAL] selected_val_id={val_id}")
+    print(f"[P9.2ABC-EVAL] verified split_counts={split_counts}")
+    return runtime_config, cfg, val_id, selected_ids, diagnostics, split_counts
 
 
 def move_to_device(obj: Any, device: torch.device) -> Any:
@@ -533,6 +641,73 @@ def save_variant_grid(frames_by_variant: dict[str, torch.Tensor], path: Path) ->
     return str(path)
 
 
+def save_labeled_eval_grid(frames_by_key: dict[str, torch.Tensor], path: Path) -> str | None:
+    ordered_keys = ["GT"] + [name for name in VARIANTS if name in frames_by_key]
+    ordered = [(key, frames_by_key[key]) for key in ordered_keys if key in frames_by_key]
+    if not ordered:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception as exc:
+        print(f"[P9.2ABC-EVAL][WARN] PIL unavailable; cannot build labeled grid {path}: {exc}")
+        return save_variant_grid({key: frame for key, frame in ordered if key != "GT"}, path)
+
+    pil_images = []
+    labels = []
+    for key, frame in ordered:
+        img = _normalize_image_tensor(frame)
+        if img.ndim != 3 or not _is_image_channel_count(img.shape[0]):
+            continue
+        if img.shape[0] == 1:
+            img = img.repeat(3, 1, 1)
+        elif img.shape[0] == 4:
+            img = img[:3]
+        array = (img.permute(1, 2, 0).clamp(0, 1) * 255.0).byte().numpy()
+        pil_images.append(Image.fromarray(array, mode="RGB"))
+        labels.append("GT" if key == "GT" else VARIANT_LABELS.get(key, key))
+    if not pil_images:
+        return None
+    width = max(img.width for img in pil_images)
+    height = max(img.height for img in pil_images)
+    label_h = 36
+    canvas = Image.new("RGB", (width * len(pil_images), height + label_h), color="white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except Exception:
+        font = ImageFont.load_default()
+    for idx, (label, img) in enumerate(zip(labels, pil_images)):
+        if img.size != (width, height):
+            img = img.resize((width, height))
+        x0 = idx * width
+        draw.text((x0 + 6, 7), label, fill=(0, 0, 0), font=font)
+        canvas.paste(img, (x0, label_h))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return str(path)
+
+
+def print_batch_debug_shapes(batch: dict[str, Any], prefix: str = "batch") -> None:
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            t_min, t_max = _tensor_min_max(value)
+            print(
+                f"[P9.2ABC-EVAL][BatchShape] {prefix}.{key}: "
+                f"type=tensor shape={list(value.shape)} dtype={value.dtype} min={t_min} max={t_max}"
+            )
+        else:
+            print(f"[P9.2ABC-EVAL][BatchShape] {prefix}.{key}: type={type(value).__name__}")
+
+
+def first_gt_image_frame_from_batch(batch: dict[str, Any]) -> torch.Tensor | None:
+    for key in ("target_rgbs", "target_rgb", "target_image", "image", "rgbs"):
+        if key in batch:
+            frames = _image_frames_from_tensor(batch[key], max_frames=1)
+            if frames:
+                return frames[0]
+    return None
+
+
 def _summarize_value(value: Any, max_items: int = 4) -> Any:
     if torch.is_tensor(value):
         tensor = value.detach().cpu()
@@ -780,6 +955,15 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
 
     lines += [
         "",
+        "## Image Grids",
+        "| batch_idx | grid_path |",
+        "|---:|---|",
+    ]
+    for batch_idx, grid_path in sorted((metrics.get("image_grids") or {}).items(), key=lambda item: int(item[0])):
+        lines.append(f"| {batch_idx} | {grid_path or 'N/A'} |")
+
+    lines += [
+        "",
         "## Aggregate Losses",
         "| Variant | total_loss mean | total_loss std | r_pixel mean | r_pixel std |",
         "|---|---:|---:|---:|---:|",
@@ -869,10 +1053,12 @@ def main() -> None:
 
     base_cfg = load_yaml(base_config)
     paths = resolve_local_paths(base_cfg, repo, local_paths_config)
-    generate_metadata(base_config, paths)
-    val_id, selected_ids = choose_val_id(Path(paths["generated_meta"]), str(paths["preferred_val_id"]))
-    runtime_config = write_resolved_config(base_config, base_cfg, paths, val_id, output_dir)
-    cfg = load_yaml(runtime_config)
+    runtime_config, cfg, val_id, selected_ids, val_id_diagnostics, verified_split_counts = resolve_valid_val_metadata(
+        base_config,
+        base_cfg,
+        paths,
+        output_dir,
+    )
 
     print(f"[P9.2ABC-EVAL] runtime_config={runtime_config}")
     print(f"[P9.2ABC-EVAL] selected_ids={selected_ids} val_id={val_id}")
@@ -882,6 +1068,8 @@ def main() -> None:
     val_loader = build_loader(cfg, "val")
     loaders = {"train": train_loader, "val": val_loader}
     split_counts = {"train": len(train_loader.dataset), "val": len(val_loader.dataset)}
+    if split_counts != verified_split_counts:
+        print(f"[P9.2ABC-EVAL][WARN] split counts changed after verification: verified={verified_split_counts} current={split_counts}")
     print(f"[P9.2ABC-EVAL] split_counts={split_counts} requested_split={args.split}")
 
     actual_split = args.split
@@ -925,6 +1113,20 @@ def main() -> None:
     batch_motion_summaries: dict[int, dict[str, Any]] = {}
     grid_frames_by_batch: dict[int, dict[str, torch.Tensor]] = {idx: {} for idx, _ in selected_batches}
     variant_configs: dict[str, Any] = {}
+
+    if args.save_images:
+        from torchvision.utils import save_image
+
+        for batch_idx, batch_cpu in selected_batches:
+            gt_frame = first_gt_image_frame_from_batch(batch_cpu)
+            if gt_frame is None:
+                print(f"[P9.2ABC-EVAL][WARN] No GT/target RGB image found for batch={batch_idx}; available batch shapes follow.")
+                print_batch_debug_shapes(batch_cpu, prefix=f"batch{batch_idx}")
+            else:
+                gt_path = image_dir / f"batch_{batch_idx:03d}_GT.png"
+                gt_path.parent.mkdir(parents=True, exist_ok=True)
+                save_image(gt_frame, gt_path)
+                grid_frames_by_batch[batch_idx]["GT"] = gt_frame
 
     for name in variants:
         ckpt_for_variant = adapter_ckpt if name == "C_zero_gt_token_trained_adapter" and adapter_ckpt and adapter_ckpt.exists() else None
@@ -974,7 +1176,7 @@ def main() -> None:
     image_grids: dict[int, str | None] = {}
     if args.save_images:
         for batch_idx, frames in grid_frames_by_batch.items():
-            image_grids[batch_idx] = save_variant_grid(frames, grid_dir / f"batch_{batch_idx:03d}_grid.png")
+            image_grids[batch_idx] = save_labeled_eval_grid(frames, grid_dir / f"batch_{batch_idx:03d}_grid.png")
 
     batch_identities = [extract_batch_identity(batch, actual_split, idx) for idx, batch in selected_batches]
     identity_json_path, identity_csv_path = write_batch_identity_files(batch_identities, output_dir)
@@ -991,6 +1193,7 @@ def main() -> None:
         "split": actual_split,
         "allow_fallback_to_train": bool(args.allow_fallback_to_train),
         "split_counts": split_counts,
+        "val_id_diagnostics": val_id_diagnostics,
         "batch_idx": args.batch_idx,
         "num_batches": args.num_batches,
         "evaluated_batch_indices": [idx for idx, _ in selected_batches],
