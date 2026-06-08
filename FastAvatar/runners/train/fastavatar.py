@@ -44,6 +44,16 @@ class FastAvatarTrainer(Trainer):
     def _build_optimizer(self, model, cfg):
         all_params = []
         total_params = 0
+        strict_adapter_only = bool(getattr(cfg.model, 'motion_token_train_adapter_only_strict', False))
+        non_adapter_trainable = [
+            n for n, p in model.named_parameters()
+            if p.requires_grad and 'motion_token_adapter' not in n
+        ]
+        if strict_adapter_only and non_adapter_trainable:
+            raise RuntimeError(
+                "motion_token_train_adapter_only_strict=True but non-motion_token_adapter parameters are trainable before optimizer construction: "
+                + ", ".join(non_adapter_trainable[:20])
+            )
         
         for n, p in model.named_parameters():
             if not p.requires_grad:
@@ -132,13 +142,16 @@ class FastAvatarTrainer(Trainer):
             use_teeth=getattr(cfg.model, 'add_teeth', True)
         )
 
+        num_train_workers = int(cfg.dataset.num_train_workers)
+        num_val_workers = int(cfg.dataset.num_val_workers)
+
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=cfg.train.batch_size,
             shuffle=True,
-            num_workers=cfg.dataset.num_train_workers,
+            num_workers=num_train_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_train_workers > 0),
             drop_last=True
         )
 
@@ -146,9 +159,9 @@ class FastAvatarTrainer(Trainer):
             val_dataset,
             batch_size=cfg.val.batch_size,
             shuffle=False,
-            num_workers=cfg.dataset.num_val_workers,
+            num_workers=num_val_workers,
             pin_memory=cfg.dataset.pin_mem,
-            persistent_workers=True,
+            persistent_workers=(num_val_workers > 0),
             drop_last=False
         )
 
@@ -177,7 +190,184 @@ class FastAvatarTrainer(Trainer):
     def register_hooks(self):
         pass
 
-    def forward_loss_local_step(self, data):
+    def _build_flame_dicts(self, data):
+        flame_keys = ['expr', 'rotation', 'neck_pose', 'jaw_pose', 'eyes_pose', 'teeth_bs', 'translation', 'shape', 'betas']
+        input_flame_params = {
+            k.replace('input_', ''): v for k, v in data.items()
+            if k.startswith('input_') and k.replace('input_', '') in flame_keys
+        }
+        target_flame_params = {
+            k.replace('target_', ''): v for k, v in data.items()
+            if k.startswith('target_') and k.replace('target_', '') in flame_keys
+        }
+        return input_flame_params, target_flame_params
+
+    def _move_batch_to_device(self, data):
+        if data is None:
+            return None
+        if torch.is_tensor(data):
+            return data.to(self.device, non_blocking=True)
+        if isinstance(data, dict):
+            return {k: self._move_batch_to_device(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._move_batch_to_device(v) for v in data]
+        if isinstance(data, tuple):
+            return tuple(self._move_batch_to_device(v) for v in data)
+        return data
+
+    def _forward_render(self, data, motion_token_input=None):
+        uid = data['uid']
+        input_image = data['rgbs']
+        target_image = data['target_rgbs']
+        input_lms = data['landmarks']
+        target_lms = data['target_landmarks']
+        landmarks = torch.cat([input_lms, target_lms], dim=1)
+        input_flame_params, target_flame_params = self._build_flame_dicts(data)
+        outputs = self.model(
+            input_image=input_image,
+            target_image=target_image,
+            input_c2ws=data['c2ws'],
+            target_c2ws=data['target_c2ws'],
+            input_intrs=data['intrs'],
+            target_intrs=data['target_intrs'],
+            input_bg_colors=data['bg_colors'],
+            target_bg_colors=data['target_bg_colors'],
+            landmarks=landmarks,
+            input_flame_params=input_flame_params,
+            inf_flame_params=target_flame_params,
+            uid=uid,
+            motion_token_input=motion_token_input,
+        )
+        outputs['full_landmarks'] = landmarks
+        return outputs, input_flame_params, target_flame_params
+
+    def _renderer_losses(self, outputs, target_image):
+        loss_renderer = 0.
+        loss_r_pixel = None
+        loss_r_perceptual = None
+        loss_r_ssim = None
+        loss_r_offset = None
+        loss_r_pruning = None
+        loss_r_id = None
+        comp_rgb = outputs['comp_rgb']
+        if self.cfg.train.loss.pixel_weight > 0.:
+            loss_r_pixel = self.pixel_loss_fn(comp_rgb, target_image)
+            loss_renderer += loss_r_pixel * self.cfg.train.loss.pixel_weight
+        if self.cfg.train.loss.perceptual_weight > 0.:
+            with torch.autocast("cuda", enabled=False):
+                loss_r_perceptual = self.perceptual_loss_fn(comp_rgb, target_image)
+                loss_renderer += loss_r_perceptual * self.cfg.train.loss.perceptual_weight
+        if self.cfg.train.loss.ssim_weight > 0.:
+            with torch.autocast("cuda", enabled=False):
+                loss_r_ssim = self.ssim_loss_fn(comp_rgb, target_image)
+                loss_renderer += loss_r_ssim * self.cfg.train.loss.ssim_weight
+        if self.cfg.train.loss.offset_weight > 0. and 'offsets' in outputs:
+            loss_r_offset = self.offset_loss_fn(outputs['offsets']) * self.cfg.train.loss.offset_weight
+            loss_renderer += loss_r_offset
+        if self.cfg.train.loss.pruning_weight > 0. and self.cfg.model.gs_pruning:
+            pruning_importance = outputs['pruning_importance']
+            if pruning_importance is not None:
+                loss_r_pruning = torch.mean(torch.sigmoid(pruning_importance))
+            else:
+                loss_r_pruning = torch.tensor(0.0, device=target_image.device)
+            loss_renderer += loss_r_pruning ** 2 * self.cfg.train.loss.pruning_weight
+        if getattr(self.cfg.train.loss, 'identity_weight', 0.0) > 0.:
+            loss_r_id = self.id_loss_fn(comp_rgb, target_image)
+            loss_renderer += loss_r_id * self.cfg.train.loss.identity_weight
+        gs_stats = outputs.get('gs_stats', None)
+        avg_remaining_gs = gs_stats['avg_remaining_gs'] if gs_stats is not None else None
+        prune_percentage = gs_stats['prune_percentage'] if gs_stats is not None else None
+        return loss_renderer, {
+            'loss_renderer': loss_renderer if isinstance(loss_renderer, torch.Tensor) else torch.tensor(loss_renderer, device=target_image.device),
+            'r_pixel': loss_r_pixel, 'r_perceptual': loss_r_perceptual, 'r_ssim': loss_r_ssim,
+            'r_offset': loss_r_offset, 'r_pruning': loss_r_pruning, 'r_id': loss_r_id,
+            'avg_remaining_gs': torch.tensor(avg_remaining_gs, device=target_image.device) if avg_remaining_gs is not None else None,
+            'prune_percentage': torch.tensor(prune_percentage, device=target_image.device) if prune_percentage is not None else None,
+        }
+
+    def _match_token_batch_size(self, token, batch_size):
+        if token.shape[0] == batch_size:
+            return token
+        if token.shape[0] == 1:
+            return token.expand(batch_size, -1).contiguous()
+        if token.shape[0] > batch_size:
+            return token[:batch_size].contiguous()
+        repeats = math.ceil(batch_size / token.shape[0])
+        return token.repeat(repeats, 1)[:batch_size].contiguous()
+
+    def _build_counterfactual_tokens(self, target_flame_params, donor_data, target_image):
+        cf_cfg = self.cfg.train.counterfactual
+        wrong_token_mode = str(getattr(cf_cfg, 'wrong_token_mode', 'shuffle_batch'))
+        if wrong_token_mode != 'shuffle_batch':
+            raise NotImplementedError(
+                f"Unsupported train.counterfactual.wrong_token_mode={wrong_token_mode!r}; only 'shuffle_batch' is implemented."
+            )
+
+        model = self.accelerator.unwrap_model(self.model)
+        correct_token = model.build_motion_token_input_from_flame(target_flame_params)
+        zero_token = torch.zeros_like(correct_token)
+        if donor_data is None:
+            wrong_token = torch.roll(correct_token, shifts=1, dims=0) if correct_token.shape[0] > 1 else zero_token
+        else:
+            donor_data = self._move_batch_to_device(donor_data)
+            _, donor_target_flame = self._build_flame_dicts(donor_data)
+            wrong_token = model.build_motion_token_input_from_flame(donor_target_flame)
+            wrong_token = self._match_token_batch_size(wrong_token, correct_token.shape[0])
+            wrong_token = wrong_token.to(device=correct_token.device, dtype=correct_token.dtype)
+        return correct_token, wrong_token, zero_token
+
+    def _counterfactual_enabled(self):
+        cf_cfg = getattr(self.cfg.train, 'counterfactual', None)
+        return bool(getattr(cf_cfg, 'enabled', False)) and bool(getattr(self.cfg.model, 'motion_token_counterfactual_training', False))
+
+    def _forward_loss_counterfactual_step(self, data, donor_data=None):
+        target_image = data['target_rgbs']
+        outputs_c, _, target_flame_params = self._forward_render(data, motion_token_input=None)
+        loss_c, loss_parts = self._renderer_losses(outputs_c, target_image)
+        correct_token, wrong_token, zero_token = self._build_counterfactual_tokens(target_flame_params, donor_data, target_image)
+
+        outputs_e, _, _ = self._forward_render(data, motion_token_input=wrong_token)
+        loss_e, _ = self._renderer_losses(outputs_e, target_image)
+        outputs_f, _, _ = self._forward_render(data, motion_token_input=zero_token)
+        loss_f, _ = self._renderer_losses(outputs_f, target_image)
+
+        cf_cfg = self.cfg.train.counterfactual
+        margin = float(getattr(cf_cfg, 'margin', 0.01))
+        alpha = float(getattr(cf_cfg, 'alpha', 0.2))
+        beta = float(getattr(cf_cfg, 'beta', 0.1))
+        if bool(getattr(cf_cfg, 'detach_negative_losses', False)):
+            loss_e_rank = loss_e.detach()
+            loss_f_rank = loss_f.detach()
+        else:
+            loss_e_rank = loss_e
+            loss_f_rank = loss_f
+        rank_wrong = torch.relu(torch.as_tensor(margin, device=loss_c.device, dtype=loss_c.dtype) + loss_c - loss_e_rank)
+        rank_zero = torch.relu(torch.as_tensor(margin, device=loss_c.device, dtype=loss_c.dtype) + loss_c - loss_f_rank)
+        total_loss = loss_c + alpha * rank_wrong + beta * rank_zero
+        loss_dict = {
+            'total_loss': total_loss,
+            'loss_renderer': loss_c,
+            'r_pixel': loss_parts.get('r_pixel'),
+            'r_perceptual': loss_parts.get('r_perceptual'),
+            'r_ssim': loss_parts.get('r_ssim'),
+            'r_offset': loss_parts.get('r_offset'),
+            'r_pruning': loss_parts.get('r_pruning'),
+            'r_id': loss_parts.get('r_id'),
+            'avg_remaining_gs': loss_parts.get('avg_remaining_gs'),
+            'prune_percentage': loss_parts.get('prune_percentage'),
+            'cf_loss_correct': loss_c,
+            'cf_loss_wrong': loss_e,
+            'cf_loss_zero': loss_f,
+            'cf_rank_wrong': rank_wrong,
+            'cf_rank_zero': rank_zero,
+            'cf_correct_lt_wrong': (loss_c.detach() < loss_e.detach()).float(),
+            'cf_correct_lt_zero': (loss_c.detach() < loss_f.detach()).float(),
+        }
+        return outputs_c, total_loss, loss_dict
+
+    def forward_loss_local_step(self, data, counterfactual_donor_data=None):
+        if self._counterfactual_enabled():
+            return self._forward_loss_counterfactual_step(data, donor_data=counterfactual_donor_data)
         uid = data['uid']
         input_image = data['rgbs']
         target_image = data['target_rgbs']
@@ -219,6 +409,21 @@ class FastAvatarTrainer(Trainer):
             uid=uid
         )
         outputs['full_landmarks'] = landmarks
+
+        if getattr(self.cfg.model, 'debug_latent_smoke_loss', False):
+            if 'latent_smoke_loss' not in outputs:
+                raise RuntimeError("model.debug_latent_smoke_loss=True requires model output key 'latent_smoke_loss'")
+            total_loss = outputs['latent_smoke_loss']
+            loss_dict = {
+                'total_loss': total_loss,
+                'loss_renderer': total_loss,
+                'latent_smoke_loss': total_loss,
+                'r_pixel': None, 'r_perceptual': None, 'r_ssim': None,
+                'r_offset': None, 'r_pruning': None, 'r_id': None,
+                'avg_remaining_gs': None, 'prune_percentage': None,
+            }
+            del uid, input_image, target_image, input_c2ws, target_c2ws, input_intrs, target_intrs, input_bg_colors, target_bg_colors, input_masks, target_masks, landmarks
+            return outputs, total_loss, loss_dict
 
         loss_renderer = 0.
         loss_r_pixel = None
@@ -290,16 +495,36 @@ class FastAvatarTrainer(Trainer):
         global_step_losses = []
 
         logger.debug(f"======== Starting epoch {self.current_epoch} ========")
+        counterfactual_donor_iter = None
+        if self._counterfactual_enabled():
+            counterfactual_donor_iter = iter(loader)
+            next(counterfactual_donor_iter, None)
 
         for data in loader:
             logger.debug(f"======== Starting global step {self.global_step} ========")
 
             with self.accelerator.accumulate(self.model):
-                # Single forward pass → dual-path losses
-                outputs, total_loss, loss_dict = self.forward_loss_local_step(data)
+                # Single forward pass or counterfactual triple-forward loss.
+                counterfactual_donor_data = None
+                if counterfactual_donor_iter is not None:
+                    try:
+                        counterfactual_donor_data = next(counterfactual_donor_iter)
+                    except StopIteration:
+                        counterfactual_donor_iter = iter(loader)
+                        counterfactual_donor_data = next(counterfactual_donor_iter, None)
+                outputs, total_loss, loss_dict = self.forward_loss_local_step(data, counterfactual_donor_data=counterfactual_donor_data)
 
                 # Single backward + step
                 self.accelerator.backward(total_loss)
+                if getattr(self.cfg.model, 'debug_latent_smoke_loss', False) and self.accelerator.is_main_process:
+                    grad_sq_sum = 0.0
+                    grad_param_count = 0
+                    for name, param in self.model.named_parameters():
+                        if name.startswith('motion_token_adapter.') and param.grad is not None:
+                            grad_sq_sum += float(param.grad.detach().float().pow(2).sum().cpu())
+                            grad_param_count += param.numel()
+                    grad_norm = math.sqrt(grad_sq_sum) if grad_sq_sum > 0.0 else 0.0
+                    print(f"[P9.2 latent smoke] MotionTokenAdapter grad_norm={grad_norm:.6e} grad_param_count={grad_param_count}")
 
                 if self.accelerator.sync_gradients and self.cfg.train.optim.clip_grad_norm > 0.:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.cfg.train.optim.clip_grad_norm)
@@ -356,6 +581,20 @@ class FastAvatarTrainer(Trainer):
                     step_info += f"SSIM:{get_val('r_ssim'):.4f} "
                 if not math.isnan(get_val('r_id')):
                     step_info += f"Id:{get_val('r_id'):.4f} "
+                if not math.isnan(get_val('cf_loss_correct')):
+                    step_info += f"LC:{get_val('cf_loss_correct'):.4f} "
+                if not math.isnan(get_val('cf_loss_wrong')):
+                    step_info += f"LE:{get_val('cf_loss_wrong'):.4f} "
+                if not math.isnan(get_val('cf_loss_zero')):
+                    step_info += f"LF:{get_val('cf_loss_zero'):.4f} "
+                if not math.isnan(get_val('cf_rank_wrong')):
+                    step_info += f"RW:{get_val('cf_rank_wrong'):.4f} "
+                if not math.isnan(get_val('cf_rank_zero')):
+                    step_info += f"RZ:{get_val('cf_rank_zero'):.4f} "
+                if not math.isnan(get_val('cf_correct_lt_wrong')):
+                    step_info += f"C<W:{get_val('cf_correct_lt_wrong'):.2f} "
+                if not math.isnan(get_val('cf_correct_lt_zero')):
+                    step_info += f"C<Z:{get_val('cf_correct_lt_zero'):.2f} "
                 # GS stats
                 if not math.isnan(get_val('avg_remaining_gs')):
                     step_info += f"GS:{get_val('avg_remaining_gs')/1000:.1f}K "
@@ -371,7 +610,10 @@ class FastAvatarTrainer(Trainer):
                 if self.global_step % self.cfg.saver.checkpoint_global_steps == 0:
                     self.save_checkpoint()
                 if self.global_step % self.cfg.val.global_step_period == 0:
-                    self.evaluate()
+                    if getattr(self.cfg.val, 'skip_eval', False):
+                        logger.info("Skip evaluation because val.skip_eval=true")
+                    else:
+                        self.evaluate()
                     self.model.train()
                 
                 del data
@@ -442,7 +684,10 @@ class FastAvatarTrainer(Trainer):
 
             # final checkpoint and evaluation
             self.save_checkpoint()
-            self.evaluate()
+            if getattr(self.cfg.val, 'skip_eval', False):
+                logger.info("Skip evaluation because val.skip_eval=true")
+            else:
+                self.evaluate()
     
     @torch.no_grad()
     @torch.compiler.disable
@@ -485,6 +730,12 @@ class FastAvatarTrainer(Trainer):
             running_losses.append(loss_tensor)
             batch_idx += 1
         
+        if not running_losses:
+            logger.warning("No validation batches were evaluated; skip loss aggregation.")
+            self.model.train()
+            clear_memory()
+            return {}
+
         total_losses = self.accelerator.gather(torch.stack(running_losses)).mean(dim=0).cpu()
         total_vals = total_losses.unbind()
         
