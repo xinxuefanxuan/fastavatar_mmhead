@@ -261,22 +261,43 @@ class Trainer(Runner):
         self.accelerator.save_state(output_dir=ckpt_dir, safe_serialization=True)
         logger.info(f"======== Saved checkpoint at global step {self.global_step} ========")
 
-        # Manage checkpoints based on retention policy
+        # Manage checkpoints based on retention policy.  Micro/debug runs can save
+        # before ``checkpoint_global_steps`` is reached; in that case there is no
+        # hierarchy level to prune yet, so keep the freshly saved checkpoint.
         if hasattr(self.cfg.saver, 'checkpoint_keep_level') and hasattr(self.cfg.saver, 'checkpoint_global_steps'):
-            ckpt_dirs = os.listdir(os.path.dirname(ckpt_dir))
-            ckpt_dirs.sort()
-            max_ckpt = int(ckpt_dirs[-1])
+            ckpt_parent = os.path.dirname(ckpt_dir)
+            ckpt_dirs = [name for name in os.listdir(ckpt_parent) if name.isdigit()]
+            ckpt_dirs.sort(key=int)
+
+            if not ckpt_dirs:
+                logger.info("Skip checkpoint pruning because no numeric checkpoints were found.")
+                return
+
             ckpt_base = int(self.cfg.saver.checkpoint_keep_level)
-            ckpt_period = self.cfg.saver.checkpoint_global_steps
-            
-            cur_order = ckpt_base ** math.floor(math.log(max_ckpt // ckpt_period, ckpt_base))
+            ckpt_period = int(self.cfg.saver.checkpoint_global_steps)
+
+            if ckpt_period <= 0:
+                logger.info("Skip checkpoint pruning because checkpoint_global_steps <= 0.")
+                return
+
+            if ckpt_base <= 1:
+                logger.info("Skip checkpoint pruning because checkpoint_keep_level <= 1.")
+                return
+
+            max_ckpt = int(ckpt_dirs[-1])
+            max_period_idx = max_ckpt // ckpt_period
+            if max_period_idx <= 0:
+                logger.info("Skip checkpoint pruning because max_ckpt < checkpoint_period.")
+                return
+
+            cur_order = ckpt_base ** math.floor(math.log(max_period_idx, ckpt_base))
             cur_idx = 0
-            
+
             while cur_order > 0:
-                cur_digit = max_ckpt // ckpt_period // cur_order % ckpt_base
+                cur_digit = max_period_idx // cur_order % ckpt_base
                 while cur_idx < len(ckpt_dirs) and int(ckpt_dirs[cur_idx]) // ckpt_period // cur_order % ckpt_base < cur_digit:
                     if int(ckpt_dirs[cur_idx]) // ckpt_period % cur_order != 0:
-                        shutil.rmtree(os.path.join(os.path.dirname(ckpt_dir), ckpt_dirs[cur_idx]))
+                        shutil.rmtree(os.path.join(ckpt_parent, ckpt_dirs[cur_idx]))
                         logger.info(f"Removed checkpoint {ckpt_dirs[cur_idx]}")
                     cur_idx += 1
                 cur_order //= ckpt_base
