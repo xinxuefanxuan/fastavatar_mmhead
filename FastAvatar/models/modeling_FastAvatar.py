@@ -82,6 +82,7 @@ class ModelFastAvatar(nn.Module):
                  motion_token_expr_dim: int = 50,
                  motion_token_pad_to_dim: int = 96,
                  motion_token_train_adapter_only_strict: bool = False,
+                 motion_token_counterfactual_training: bool = False,
                  **kwargs,
                  ):
         super().__init__()
@@ -117,6 +118,7 @@ class ModelFastAvatar(nn.Module):
         self.motion_token_expr_dim = int(motion_token_expr_dim)
         self.motion_token_pad_to_dim = int(motion_token_pad_to_dim)
         self.motion_token_train_adapter_only_strict = bool(motion_token_train_adapter_only_strict)
+        self.motion_token_counterfactual_training = bool(motion_token_counterfactual_training)
         self.motion_token_norm_mean = None
         self.motion_token_norm_std = None
         if self.motion_token_norm_stats:

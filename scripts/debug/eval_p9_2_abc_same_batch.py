@@ -358,6 +358,42 @@ def build_flame_dicts(data: dict[str, Any]) -> tuple[dict[str, torch.Tensor], di
     return input_flame_params, target_flame_params
 
 
+def _as_bchw_image(tensor: torch.Tensor) -> torch.Tensor | None:
+    if tensor.ndim == 5:
+        if tensor.shape[2] in (1, 3, 4):
+            b, t, c, h, w = tensor.shape
+            return tensor.reshape(b * t, c, h, w)
+        if tensor.shape[-1] in (1, 3, 4):
+            b, t, h, w, c = tensor.shape
+            return tensor.permute(0, 1, 4, 2, 3).reshape(b * t, c, h, w)
+    if tensor.ndim == 4:
+        if tensor.shape[1] in (1, 3, 4):
+            return tensor
+        if tensor.shape[-1] in (1, 3, 4):
+            return tensor.permute(0, 3, 1, 2)
+    return None
+
+
+def _crop_l1(pred: torch.Tensor, target: torch.Tensor, y0: float, y1: float, x0: float, x1: float) -> float | None:
+    pred_img = _as_bchw_image(pred)
+    target_img = _as_bchw_image(target)
+    if pred_img is None or target_img is None or pred_img.shape != target_img.shape:
+        return None
+    _, _, h, w = pred_img.shape
+    ya, yb = max(0, int(h * y0)), min(h, max(int(h * y1), int(h * y0) + 1))
+    xa, xb = max(0, int(w * x0)), min(w, max(int(w * x1), int(w * x0) + 1))
+    return float((pred_img[..., ya:yb, xa:xb] - target_img[..., ya:yb, xa:xb]).abs().mean().detach().cpu())
+
+
+def roi_l1_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float | None]:
+    return {
+        "full_image_l1": _crop_l1(pred, target, 0.0, 1.0, 0.0, 1.0),
+        "center_face_crop_l1": _crop_l1(pred, target, 0.18, 0.82, 0.18, 0.82),
+        "mouth_lower_face_crop_l1": _crop_l1(pred, target, 0.55, 0.90, 0.25, 0.75),
+        "upper_face_crop_l1": _crop_l1(pred, target, 0.20, 0.58, 0.22, 0.78),
+    }
+
+
 def forward_and_loss(
     model: torch.nn.Module,
     cfg: Any,
@@ -390,12 +426,17 @@ def forward_and_loss(
         "r_perceptual": None,
         "r_ssim": None,
         "r_id": None,
+        "full_image_l1": None,
+        "center_face_crop_l1": None,
+        "mouth_lower_face_crop_l1": None,
+        "upper_face_crop_l1": None,
     }
     if "comp_rgb" in outputs:
         pixel_loss = PixelLoss(option=cfg.train.loss.pixel_loss_type)(outputs["comp_rgb"], batch["target_rgbs"])
         total = pixel_loss * float(cfg.train.loss.pixel_weight)
         losses["r_pixel"] = tensor_scalar(pixel_loss)
         losses["total_loss"] = tensor_scalar(total)
+        losses.update(roi_l1_metrics(outputs["comp_rgb"], batch["target_rgbs"]))
     elif "latent_smoke_loss" in outputs:
         losses["total_loss"] = tensor_scalar(outputs["latent_smoke_loss"])
     return outputs, losses
@@ -962,6 +1003,10 @@ def compute_aggregate(per_batch_results: dict[int, dict[str, Any]]) -> dict[str,
         aggregate["variants"][variant] = {
             "total_loss": mean_std([loss.get("total_loss") for loss in losses]),
             "r_pixel": mean_std([loss.get("r_pixel") for loss in losses]),
+            "full_image_l1": mean_std([loss.get("full_image_l1") for loss in losses]),
+            "center_face_crop_l1": mean_std([loss.get("center_face_crop_l1") for loss in losses]),
+            "mouth_lower_face_crop_l1": mean_std([loss.get("mouth_lower_face_crop_l1") for loss in losses]),
+            "upper_face_crop_l1": mean_std([loss.get("upper_face_crop_l1") for loss in losses]),
         }
 
     def r_pixel(rows: dict[str, Any], variant: str) -> float | None:
@@ -1050,6 +1095,10 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
         "r_perceptual",
         "r_ssim",
         "r_id",
+        "full_image_l1",
+        "center_face_crop_l1",
+        "mouth_lower_face_crop_l1",
+        "upper_face_crop_l1",
         "adapter_loaded",
         "random_adapter",
         "token_override",
@@ -1070,6 +1119,10 @@ def write_per_batch_csv(per_batch_results: dict[int, dict[str, Any]], output_dir
                     "r_perceptual": losses.get("r_perceptual"),
                     "r_ssim": losses.get("r_ssim"),
                     "r_id": losses.get("r_id"),
+                    "full_image_l1": losses.get("full_image_l1"),
+                    "center_face_crop_l1": losses.get("center_face_crop_l1"),
+                    "mouth_lower_face_crop_l1": losses.get("mouth_lower_face_crop_l1"),
+                    "upper_face_crop_l1": losses.get("upper_face_crop_l1"),
                     "adapter_loaded": row.get("adapter_loaded", False),
                     "random_adapter": row.get("random_adapter", False),
                     "token_override": row.get("token_override"),
@@ -1180,15 +1233,20 @@ def write_report(metrics: dict[str, Any], output_dir: Path) -> None:
     lines += [
         "",
         "## Aggregate Losses",
-        "| Variant | total_loss mean | total_loss std | r_pixel mean | r_pixel std |",
-        "|---|---:|---:|---:|---:|",
+        "| Variant | total_loss mean | total_loss std | r_pixel mean | r_pixel std | full L1 mean | center L1 mean | mouth/lower L1 mean | upper L1 mean |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, stats in aggregate.get("variants", {}).items():
         total = stats.get("total_loss", {})
         pixel = stats.get("r_pixel", {})
+        full = stats.get("full_image_l1", {})
+        center = stats.get("center_face_crop_l1", {})
+        mouth = stats.get("mouth_lower_face_crop_l1", {})
+        upper = stats.get("upper_face_crop_l1", {})
         lines.append(
             f"| {name} | {fmt_float(total.get('mean'))} | {fmt_float(total.get('std'))} | "
-            f"{fmt_float(pixel.get('mean'))} | {fmt_float(pixel.get('std'))} |"
+            f"{fmt_float(pixel.get('mean'))} | {fmt_float(pixel.get('std'))} | {fmt_float(full.get('mean'))} | "
+            f"{fmt_float(center.get('mean'))} | {fmt_float(mouth.get('mean'))} | {fmt_float(upper.get('mean'))} |"
         )
 
     lines += [
