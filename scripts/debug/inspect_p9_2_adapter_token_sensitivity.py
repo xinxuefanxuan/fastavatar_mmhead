@@ -249,6 +249,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_ids", default="030,037,038,069,070")
     parser.add_argument("--holdout_ids", default="083")
     parser.add_argument("--sacrificial_val_id", default=None)
+    parser.add_argument("--metadata_max_ids", type=int, default=6)
+    parser.add_argument("--metadata_max_items_per_id", type=int, default=4)
+    parser.add_argument("--metadata_prefer_ids", default=None, help="Optional comma-separated IDs to prioritize when generating metadata.")
     parser.add_argument("--batch_idx", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -271,7 +274,7 @@ def build_eval_loader(args: argparse.Namespace, base_cfg: Any, paths: dict[str, 
             sacrificial_val_id = candidates[0]
         metadata_requested_ids = list(dict.fromkeys(holdout_ids + [sacrificial_val_id]))
         prefer_ids = train_ids + [uid for uid in metadata_requested_ids if uid not in set(train_ids)]
-        generate_metadata(args.base_config, paths, prefer_ids=prefer_ids, max_ids=max(6, len(prefer_ids)))
+        generate_metadata(args.base_config, paths, prefer_ids=prefer_ids, max_ids=max(args.metadata_max_ids, len(prefer_ids)), max_items_per_id=args.metadata_max_items_per_id)
         generated_meta = Path(paths["generated_meta"])
         holdout_meta = output_dir / "runtime_configs" / "adapter_sensitivity_holdout_mixed_uids.json"
         holdout_meta, selected_ids, holdout_item_count = filter_metadata_by_ids(generated_meta, holdout_meta, metadata_requested_ids)
@@ -294,7 +297,8 @@ def build_eval_loader(args: argparse.Namespace, base_cfg: Any, paths: dict[str, 
         split_counts = {"holdout": len(loader.dataset), "train_style_loader": len(loader.dataset)}
         return cfg, loader, "holdout_trainstyle_sacrificial_val", selected_ids, sacrificial_val_id, holdout_ids, split_counts
 
-    generate_metadata(args.base_config, paths)
+    prefer_ids = parse_id_list(args.metadata_prefer_ids)
+    generate_metadata(args.base_config, paths, prefer_ids=prefer_ids or None, max_ids=args.metadata_max_ids, max_items_per_id=args.metadata_max_items_per_id)
     val_id, selected_ids = choose_val_id(Path(paths["generated_meta"]), str(paths["preferred_val_id"]))
     runtime_config = write_resolved_config(args.base_config, base_cfg, paths, val_id, output_dir)
     cfg = load_yaml(runtime_config)

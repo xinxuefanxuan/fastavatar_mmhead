@@ -84,7 +84,13 @@ def extract_uid(key: str) -> str:
     return key.split("/", 1)[0]
 
 
-def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_ids: list[str] | None = None, max_ids: int = 6) -> None:
+def generate_metadata(
+    base_config: Path,
+    paths: dict[str, Path | str],
+    prefer_ids: list[str] | None = None,
+    max_ids: int = 6,
+    max_items_per_id: int = 4,
+) -> None:
     cmd = [
         sys.executable,
         "scripts/debug/create_p9_2_overfit_metadata.py",
@@ -101,7 +107,7 @@ def generate_metadata(base_config: Path, paths: dict[str, Path | str], prefer_id
         "--max_ids",
         str(max_ids),
         "--max_items_per_id",
-        "4",
+        str(max_items_per_id),
     ]
     if prefer_ids:
         cmd.extend(["--prefer_ids", ",".join(prefer_ids)])
@@ -1275,6 +1281,7 @@ def main() -> None:
     parser.add_argument("--train_ids", default="030,037,038,069,070", help="Comma-separated adapter-training IDs for disjointness/reporting checks.")
     parser.add_argument("--sacrificial_val_id", default=None, help="Train ID to include in holdout metadata and exclude via val_id for train-style holdout eval.")
     parser.add_argument("--eval_protocol", choices=("native_val", "holdout_trainstyle", "holdout_trainstyle_no_val_exclusion", "holdout_trainstyle_sacrificial_val"), default=None)
+    parser.add_argument("--metadata_max_items_per_id", type=int, default=4, help="Max metadata frame groups per ID when this script generates eval metadata.")
     parser.add_argument("--batch_idx", "--batch_index", dest="batch_idx", type=int, default=0)
     parser.add_argument("--num_batches", type=int, default=1)
     parser.add_argument("--save_images", dest="save_images", action="store_true", default=True)
@@ -1332,7 +1339,7 @@ def main() -> None:
             raise RuntimeError(f"sacrificial_val_id={sacrificial_val_id} must not be in holdout_ids={holdout_ids}")
         metadata_requested_ids = list(dict.fromkeys(holdout_ids + [sacrificial_val_id]))
         prefer_ids = train_ids + [uid for uid in metadata_requested_ids if uid not in set(train_ids)]
-        generate_metadata(base_config, paths, prefer_ids=prefer_ids, max_ids=max(6, len(prefer_ids)))
+        generate_metadata(base_config, paths, prefer_ids=prefer_ids, max_ids=max(6, len(prefer_ids)), max_items_per_id=args.metadata_max_items_per_id)
         generated_meta = Path(paths["generated_meta"])
         holdout_meta = output_dir / "runtime_configs" / "holdout_eval_mixed_uids.json"
         holdout_meta, selected_ids, holdout_item_count = filter_metadata_by_ids(generated_meta, holdout_meta, metadata_requested_ids)
@@ -1385,7 +1392,7 @@ def main() -> None:
         print(f"[P9.2ABC-EVAL] train_ids_used_for_adapter={train_ids}")
         print(f"[P9.2ABC-EVAL] eval_count={holdout_dataset_len}")
     else:
-        generate_metadata(base_config, paths)
+        generate_metadata(base_config, paths, max_items_per_id=args.metadata_max_items_per_id)
         val_id, selected_ids = choose_val_id(Path(paths["generated_meta"]), str(paths["preferred_val_id"]))
         runtime_config = write_resolved_config(base_config, base_cfg, paths, val_id, output_dir)
         cfg = load_yaml(runtime_config)
