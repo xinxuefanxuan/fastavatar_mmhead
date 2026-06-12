@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from motion_model.channel_vae import ChannelTemporalVAE
+from motion_model.motion_safety import apply_motion_safety, apply_smile_profile, load_safety_config
 
 HEAD_PRIMITIVES = {"turn_left", "turn_right", "look_up", "look_down", "tilt_left", "tilt_right", "nod"}
 PRIMITIVE_SYNONYMS = {
@@ -232,6 +233,12 @@ def main() -> None:
     ap.add_argument("--release_each_segment", action="store_true")
     ap.add_argument("--transition_mode", choices=["linear", "smoothstep"], default="smoothstep")
     ap.add_argument("--motion_key", default="motion")
+    ap.add_argument("--motion_safety_config", type=Path, default=None)
+    ap.add_argument("--apply_motion_safety", action="store_true")
+    ap.add_argument("--save_pre_safety_motion", type=Path, default=None)
+    ap.add_argument("--save_safety_report", type=Path, default=None)
+    ap.add_argument("--smile_gain", type=float, default=1.0)
+    ap.add_argument("--smile_profile", choices=["default", "strong", "subtle"], default="default")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
@@ -311,6 +318,23 @@ def main() -> None:
 
     out_raw = np.concatenate(segment_motions, axis=0) if segment_motions else np.zeros((1, 56), dtype=np.float32)
     out_raw = fit_output_len(out_raw, args.output_len).astype(np.float32)
+
+    safety_report = None
+    safety_cfg = load_safety_config(args.motion_safety_config)
+    labels_flat = [lab for seg in segments for lab in seg["labels"]]
+    if args.apply_motion_safety:
+        if "turn_left" in labels_flat:
+            out_raw[:, 51] *= float(safety_cfg.get("turn_left_scale", 1.0) or 1.0)
+        if "turn_right" in labels_flat:
+            out_raw[:, 51] *= float(safety_cfg.get("turn_right_scale", 1.0) or 1.0)
+    if "smile" in labels_flat and (abs(args.smile_gain - 1.0) > 1e-6 or args.smile_profile != "default"):
+        out_raw = apply_smile_profile(out_raw, args.smile_gain, args.smile_profile)
+    if args.save_pre_safety_motion:
+        args.save_pre_safety_motion.parent.mkdir(parents=True, exist_ok=True)
+        pre_norm = (out_raw - mean[None, :]) / np.maximum(std[None, :], 1e-8)
+        np.savez(args.save_pre_safety_motion, motion=out_raw, motion_raw=out_raw, motion_norm=pre_norm.astype(np.float32), expr_delta=out_raw[:, :50], head_delta=out_raw[:, 50:53], jaw_delta=out_raw[:, 53:56])
+    if args.apply_motion_safety:
+        out_raw, safety_report = apply_motion_safety(out_raw, safety_cfg)
     out_norm = (out_raw - mean[None, :]) / np.maximum(std[None, :], 1e-8)
 
     args.output_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -333,6 +357,15 @@ def main() -> None:
         plan = {"prompt": args.prompt, "carry_mode": args.carry_mode, "segments": plan_segments, "output_npz": str(args.output_npz), "final_stats": final_stats}
         args.output_plan_json.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         print("plan:", args.output_plan_json)
+
+    if args.save_safety_report:
+        args.save_safety_report.parent.mkdir(parents=True, exist_ok=True)
+        if safety_report is None:
+            safety_report = {"enabled": False, "config": safety_cfg, "reason": "--apply_motion_safety not set"}
+        else:
+            safety_report = {"enabled": True, **safety_report}
+        args.save_safety_report.write_text(json.dumps(safety_report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("safety_report:", args.save_safety_report)
 
 
 if __name__ == "__main__":
