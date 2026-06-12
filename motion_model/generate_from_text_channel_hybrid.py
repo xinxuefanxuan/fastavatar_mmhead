@@ -7,6 +7,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from motion_model.channel_vae import ChannelTemporalVAE
 from motion_model.train_text_to_channel_hybrid import HybridNet, DEFAULT_SCALES
+from motion_model.motion_safety import apply_motion_safety, apply_smile_profile, load_safety_config
 
 NEW_HEAD_PRIMITIVES = ['look_up', 'look_down', 'tilt_left', 'tilt_right']
 
@@ -72,6 +73,12 @@ def main():
     ap.add_argument('--manual_channel_weights_json',type=Path,default=None)
     ap.add_argument('--generation_mode',choices=['proto_only','hybrid','direct_residual'],default='hybrid')
     ap.add_argument('--use_residual_with_manual_labels',action='store_true')
+    ap.add_argument('--motion_safety_config', type=Path, default=None)
+    ap.add_argument('--apply_motion_safety', action='store_true')
+    ap.add_argument('--save_pre_safety_motion', type=Path, default=None)
+    ap.add_argument('--save_safety_report', type=Path, default=None)
+    ap.add_argument('--smile_gain', type=float, default=1.0)
+    ap.add_argument('--smile_profile', choices=['default', 'strong', 'subtle'], default='default')
     args=ap.parse_args()
     dev=torch.device(args.device if torch.cuda.is_available() or args.device=='cpu' else 'cpu')
 
@@ -155,6 +162,23 @@ def main():
     mnorm=np.concatenate([en,hn,jn],axis=1)
     st=json.loads(args.norm_stats.read_text()); mean=np.asarray(st['mean'],np.float32)[:56]; std=np.asarray(st['std'],np.float32)[:56]
     mraw=mnorm*std[None,:]+mean[None,:]
+    safety_report=None
+    safety_cfg=load_safety_config(args.motion_safety_config)
+    selected_labels=[k for k,v in primitive_scores.items() if v>0]
+    if args.apply_motion_safety:
+        if 'turn_left' in selected_labels:
+            mraw[:,51]*=float(safety_cfg.get('turn_left_scale',1.0) or 1.0)
+        if 'turn_right' in selected_labels:
+            mraw[:,51]*=float(safety_cfg.get('turn_right_scale',1.0) or 1.0)
+    if 'smile' in selected_labels and (abs(args.smile_gain-1.0)>1e-6 or args.smile_profile!='default'):
+        mraw=apply_smile_profile(mraw,args.smile_gain,args.smile_profile)
+    if args.save_pre_safety_motion:
+        args.save_pre_safety_motion.parent.mkdir(parents=True,exist_ok=True)
+        pre_norm=(mraw-mean[None,:])/np.maximum(std[None,:],1e-8)
+        np.savez(args.save_pre_safety_motion,motion=mraw.astype(np.float32),motion_raw=mraw.astype(np.float32),motion_norm=pre_norm.astype(np.float32),expr_delta=mraw[:,:50].astype(np.float32),head_delta=mraw[:,50:53].astype(np.float32),jaw_delta=mraw[:,53:56].astype(np.float32))
+    if args.apply_motion_safety:
+        mraw,safety_report=apply_motion_safety(mraw,safety_cfg)
+        mnorm=(mraw-mean[None,:])/np.maximum(std[None,:],1e-8)
     args.output_npz.parent.mkdir(parents=True,exist_ok=True)
     np.savez(args.output_npz,motion=mraw.astype(np.float32),motion_raw=mraw.astype(np.float32),motion_norm=mnorm.astype(np.float32),expr_delta=mraw[:,:50].astype(np.float32),head_delta=mraw[:,50:53].astype(np.float32),jaw_delta=mraw[:,53:56].astype(np.float32))
 
@@ -166,5 +190,13 @@ def main():
     print('final z norms:',{k:float(v.norm().item()) for k,v in zf.items()})
     for k,v in stats(mraw).items(): print(k,v)
     print('output:',args.output_npz)
+    if args.save_safety_report:
+        args.save_safety_report.parent.mkdir(parents=True,exist_ok=True)
+        if safety_report is None:
+            safety_report={'enabled':False,'config':safety_cfg,'reason':'--apply_motion_safety not set'}
+        else:
+            safety_report={'enabled':True,**safety_report}
+        args.save_safety_report.write_text(json.dumps(safety_report,ensure_ascii=False,indent=2),encoding='utf-8')
+        print('safety_report:',args.save_safety_report)
 
 if __name__=='__main__': main()

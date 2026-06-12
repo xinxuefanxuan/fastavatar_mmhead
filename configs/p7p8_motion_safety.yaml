@@ -1,0 +1,14 @@
+# P8.6 conservative safety defaults for P7/P8 56D FastAvatar-readable motion.
+# Layout: expr=0:50, neck/head pose=50:53 (pitch,yaw,roll), jaw=53:56.
+max_abs_yaw: 0.12
+max_abs_pitch: 0.10
+max_abs_roll: 0.10
+max_head_step: 0.025
+head_smooth_window: 3
+max_expr_norm: 4.0
+max_jaw: 0.35
+max_jaw_step: 0.05
+turn_left_scale: 1.0
+turn_right_scale: 0.8
+smile_gain: 1.0
+open_mouth_gain: 1.0
