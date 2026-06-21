@@ -14,6 +14,7 @@ Usage:
     [--sequence_name <name>] \
     [--neutral_template <dir>] \
     [--pack_root <dir>] \
+    [--head_target <neck_pose|rotation>] \
     [--inference_n_frames <n>] \
     [--cuda_visible_devices <ids>]
 
@@ -27,6 +28,7 @@ CASE_NAME="${CASE_NAME:-}"
 SEQUENCE_NAME="${SEQUENCE_NAME:-nersemble_seq_214}"
 NEUTRAL_TEMPLATE="${NEUTRAL_TEMPLATE:-assets/sample_motion/nersemble_seq_214_neutral}"
 PACK_ROOT="${PACK_ROOT:-}"
+HEAD_TARGET="${HEAD_TARGET:-neck_pose}"
 INFERENCE_N_FRAMES="${INFERENCE_N_FRAMES:-32}"
 MAX_SINGLE_FRAME_RENDER="${MAX_SINGLE_FRAME_RENDER:-8}"
 CUDA_VISIBLE_DEVICES_VALUE="${CUDA_VISIBLE_DEVICES:-7}"
@@ -62,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       PACK_ROOT="$2"
       shift 2
       ;;
+    --head_target)
+      HEAD_TARGET="$2"
+      shift 2
+      ;;
     --inference_n_frames)
       INFERENCE_N_FRAMES="$2"
       shift 2
@@ -95,6 +101,10 @@ if [[ ! -d "${NEUTRAL_TEMPLATE}" ]]; then
   printf '[ERROR] neutral_template not found: %s\n' "${NEUTRAL_TEMPLATE}" >&2
   exit 1
 fi
+if [[ "${HEAD_TARGET}" != "neck_pose" && "${HEAD_TARGET}" != "rotation" ]]; then
+  printf '[ERROR] --head_target must be neck_pose or rotation; got: %s\n' "${HEAD_TARGET}" >&2
+  exit 2
+fi
 
 CASE_RENDER_DIR="${OUTPUT_DIR}/${CASE_NAME}/fastavatar_render"
 PACK_ROOT="${PACK_ROOT:-${CASE_RENDER_DIR}/pack}"
@@ -116,6 +126,7 @@ printf '[FastAvatarCase] case_name=%s\n' "${CASE_NAME}"
 printf '[FastAvatarCase] sequence_name=%s\n' "${SEQUENCE_NAME}"
 printf '[FastAvatarCase] neutral_template=%s\n' "${NEUTRAL_TEMPLATE}"
 printf '[FastAvatarCase] pack_root=%s\n' "${PACK_ROOT}"
+printf '[FastAvatarCase] head_target=%s\n' "${HEAD_TARGET}"
 printf '[FastAvatarCase] inference_n_frames=%s\n' "${INFERENCE_N_FRAMES}"
 printf '[FastAvatarCase] cuda_visible_devices=%s\n' "${CUDA_VISIBLE_DEVICES_VALUE}"
 
@@ -126,7 +137,7 @@ python text_motion/render_motion_npz.py \
   --pack_root "${PACK_ROOT}" \
   --sequence_name "${SEQUENCE_NAME}" \
   --motion_key motion \
-  --head_target neck_pose \
+  --head_target "${HEAD_TARGET}" \
   --overwrite > "${PACK_LOG}" 2>&1
 
 : > "${INFER_LOG}"
