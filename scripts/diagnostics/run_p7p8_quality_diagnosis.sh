@@ -8,6 +8,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/mmhead_debug/p7p8_quality_diagnosis}"
 GENERATOR="${GENERATOR:-motion_model/generate_from_text_temporal.py}"
 SAFETY_CONFIG="${SAFETY_CONFIG:-configs/p7p8_motion_safety.yaml}"
 FASTAVATAR_RENDER_CMD_TEMPLATE="${FASTAVATAR_RENDER_CMD_TEMPLATE:-}"
+RUN_FASTAVATAR_RENDER="${RUN_FASTAVATAR_RENDER:-0}"
+FASTAVATAR_RENDER_WRAPPER="${FASTAVATAR_RENDER_WRAPPER:-scripts/diagnostics/render_fastavatar_case.sh}"
+FASTAVATAR_SEQUENCE_NAME="${FASTAVATAR_SEQUENCE_NAME:-nersemble_seq_214}"
+NEUTRAL_TEMPLATE="${NEUTRAL_TEMPLATE:-assets/sample_motion/nersemble_seq_214_neutral}"
+FASTAVATAR_PACK_ROOT_BASE="${FASTAVATAR_PACK_ROOT_BASE:-}"
+INFERENCE_N_FRAMES="${INFERENCE_N_FRAMES:-32}"
 LOG_DIR="outputs/mmhead_debug/logs"
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
@@ -19,6 +25,10 @@ printf '[P7/P8 diagnosis] GENERATOR=%s\n' "${GENERATOR}"
 printf '[P7/P8 diagnosis] SAFETY_CONFIG=%s\n' "${SAFETY_CONFIG}"
 printf '[P7/P8 diagnosis] OUTPUT_DIR=%s\n' "${OUTPUT_DIR}"
 printf '[P7/P8 diagnosis] CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES:-unset}"
+printf '[P7/P8 diagnosis] RUN_FASTAVATAR_RENDER=%s\n' "${RUN_FASTAVATAR_RENDER}"
+printf '[P7/P8 diagnosis] FASTAVATAR_SEQUENCE_NAME=%s\n' "${FASTAVATAR_SEQUENCE_NAME}"
+printf '[P7/P8 diagnosis] NEUTRAL_TEMPLATE=%s\n' "${NEUTRAL_TEMPLATE}"
+printf '[P7/P8 diagnosis] INFERENCE_N_FRAMES=%s\n' "${INFERENCE_N_FRAMES}"
 
 if [[ ! -f "${GENERATOR}" ]]; then
   printf '[ERROR] GENERATOR file does not exist: %s\n' "${GENERATOR}" >&2
@@ -26,6 +36,14 @@ if [[ ! -f "${GENERATOR}" ]]; then
 fi
 if [[ ! -f "${SAFETY_CONFIG}" ]]; then
   printf '[ERROR] SAFETY_CONFIG file does not exist: %s\n' "${SAFETY_CONFIG}" >&2
+  exit 1
+fi
+if [[ "${RUN_FASTAVATAR_RENDER}" == "1" && ! -f "${FASTAVATAR_RENDER_WRAPPER}" ]]; then
+  printf '[ERROR] FASTAVATAR_RENDER_WRAPPER file does not exist: %s\n' "${FASTAVATAR_RENDER_WRAPPER}" >&2
+  exit 1
+fi
+if [[ "${RUN_FASTAVATAR_RENDER}" == "1" && ! -d "${NEUTRAL_TEMPLATE}" ]]; then
+  printf '[ERROR] NEUTRAL_TEMPLATE directory does not exist: %s\n' "${NEUTRAL_TEMPLATE}" >&2
   exit 1
 fi
 
@@ -66,6 +84,7 @@ summary="${OUTPUT_DIR}/summary_report.md"
 
 failed_generations=0
 successful_generations=0
+failed_fastavatar_renders=0
 
 for prompt in "${prompts[@]}"; do
   slug="${prompt// /_}"
@@ -79,6 +98,7 @@ for prompt in "${prompts[@]}"; do
   motion_link="skipped"
   flame_link="skipped"
   fa_status="skipped"
+  fa_compare_dir="${case_dir}/fastavatar"
 
   printf '[P7/P8 diagnosis] generating case=%s\n' "${prompt}"
   if python "${GENERATOR}" \
@@ -105,7 +125,30 @@ for prompt in "${prompts[@]}"; do
     motion_link="[motion_report](${slug}/motion_stats/motion_report.md)"
     flame_link="[flame_report](${slug}/flame_preview/flame_mesh_report.md)"
 
-    if [[ -n "${FASTAVATAR_RENDER_CMD_TEMPLATE}" ]]; then
+    if [[ "${RUN_FASTAVATAR_RENDER}" == "1" ]]; then
+      fa_log="${case_dir}/fastavatar_render.log"
+      fa_pack_root="${case_dir}/fastavatar_pack"
+      fa_compare_dir="${case_dir}/fastavatar_render"
+      if [[ -n "${FASTAVATAR_PACK_ROOT_BASE}" ]]; then
+        fa_pack_root="${FASTAVATAR_PACK_ROOT_BASE}/${slug}_fastavatar_pack"
+      fi
+      if bash "${FASTAVATAR_RENDER_WRAPPER}" \
+          --motion_npz "${post_npz}" \
+          --output_dir "${OUTPUT_DIR}" \
+          --case_name "${slug}" \
+          --sequence_name "${FASTAVATAR_SEQUENCE_NAME}" \
+          --neutral_template "${NEUTRAL_TEMPLATE}" \
+          --pack_root "${fa_pack_root}" \
+          --inference_n_frames "${INFERENCE_N_FRAMES}" \
+          --cuda_visible_devices "${CUDA_VISIBLE_DEVICES:-7}" > "${fa_log}" 2>&1; then
+        fa_status="[video](fastavatar_video/${slug}.mp4)"
+      else
+        fa_status="[render_failed](${slug}/fastavatar_render.log)"
+        failed_fastavatar_renders=$((failed_fastavatar_renders + 1))
+        printf '[ERROR] FastAvatar render failed for case=%s; last 120 lines of %s:\n' "${prompt}" "${fa_log}" >&2
+        tail -n 120 "${fa_log}" >&2 || true
+      fi
+    elif [[ -n "${FASTAVATAR_RENDER_CMD_TEMPLATE}" ]]; then
       fa_dir="${case_dir}/fastavatar"
       mkdir -p "${fa_dir}"
       cmd="${FASTAVATAR_RENDER_CMD_TEMPLATE//\{motion\}/${post_npz}}"
@@ -123,7 +166,7 @@ for prompt in "${prompts[@]}"; do
     python scripts/diagnostics/compare_flame_fastavatar_motion_quality.py \
       --motion_npz "${post_npz}" \
       --flame_dir "${case_dir}/flame_preview" \
-      --fastavatar_dir "${case_dir}/fastavatar" \
+      --fastavatar_dir "${fa_compare_dir}" \
       --output_report "${case_dir}/case_report.md" \
       --render_issue "${prompt}" > "${case_dir}/compare.log" 2>&1 || true
   else
@@ -147,5 +190,9 @@ EOF
 printf '[P7/P8 diagnosis] summary=%s\n' "${summary}"
 if (( successful_generations == 0 && failed_generations > 0 )); then
   printf '[ERROR] all %d case generations failed; see per-case generate.log files and %s\n' "${failed_generations}" "${summary}" >&2
+  exit 1
+fi
+if [[ "${RUN_FASTAVATAR_RENDER}" == "1" && "${failed_fastavatar_renders}" -gt 0 ]]; then
+  printf '[ERROR] %d FastAvatar render(s) failed; see %s\n' "${failed_fastavatar_renders}" "${summary}" >&2
   exit 1
 fi
