@@ -1,0 +1,21 @@
+# P7/P8 stable demo safety preset.
+# This keeps the original configs/p7p8_motion_safety.yaml unchanged.
+#
+# Render diagnostics summary:
+# - turn yaw sweep favors a visible but still conservative yaw cap around 0.18.
+# - smoother turn motion reduces aggressive right-turn stepping/artifacts.
+# - smile remains a subtle/closed-mouth demo primitive; current FastAvatar/MMHead
+#   smile basis does not robustly support a clean natural teeth smile.
+# - open_mouth is retained because jaw response is visible in FastAvatar renders.
+max_abs_yaw: 0.18
+max_abs_pitch: 0.10
+max_abs_roll: 0.10
+max_head_step: 0.018
+head_smooth_window: 5
+max_expr_norm: 4.0
+max_jaw: 0.35
+max_jaw_step: 0.05
+turn_left_scale: 1.0
+turn_right_scale: 1.0
+smile_gain: 1.0
+open_mouth_gain: 1.0

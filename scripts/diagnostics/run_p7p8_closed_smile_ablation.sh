@@ -9,8 +9,9 @@ SOURCE_DIR="${SOURCE_DIR:-outputs/mmhead_debug/p7p8_smile_calibration/clean_cand
 RENDER_WRAPPER="${RENDER_WRAPPER:-scripts/diagnostics/render_fastavatar_case.sh}"
 SEQUENCE_NAME="${SEQUENCE_NAME:-nersemble_seq_214}"
 NEUTRAL_TEMPLATE="${NEUTRAL_TEMPLATE:-assets/sample_motion/nersemble_seq_214_neutral}"
-EXPR_GAINS="${EXPR_GAINS:-0.6 0.8 1.0 1.2}"
+EXPR_GAINS="${GAINS:-${EXPR_GAINS:-0.6 0.8 1.0 1.2}}"
 JAW_MODES="${JAW_MODES:-zero original_0.25 original_0.5}"
+CANDIDATE_RANKS="${CANDIDATE_RANKS:-}"
 INFERENCE_N_FRAMES="${INFERENCE_N_FRAMES:-16}"
 MAX_SINGLE_FRAME_RENDER="${MAX_SINGLE_FRAME_RENDER:-2}"
 CUDA_VISIBLE_DEVICES_VALUE="${CUDA_VISIBLE_DEVICES:-7}"
@@ -19,21 +20,34 @@ SKIP_EXISTING="${SKIP_EXISTING:-1}"
 CONTINUE_ON_RENDER_FAIL="${CONTINUE_ON_RENDER_FAIL:-1}"
 LIMIT_COMBOS="${LIMIT_COMBOS:-0}"
 
+EXPR_GAINS="${EXPR_GAINS//,/ }"
+JAW_MODES="${JAW_MODES//,/ }"
+CANDIDATE_RANKS="${CANDIDATE_RANKS//,/ }"
+
 NPZ_DIR="${OUTPUT_DIR}/ablation_npz"
 FRAME_DIR="${OUTPUT_DIR}/frames"
 VIDEO_DIR="${OUTPUT_DIR}/fastavatar_video"
-REPORT="${OUTPUT_DIR}/closed_smile_ablation_report.md"
-GRID="${OUTPUT_DIR}/closed_smile_ablation_grid.png"
-MANIFEST="${OUTPUT_DIR}/closed_smile_ablation_manifest.json"
-RENDER_STATUS="${OUTPUT_DIR}/closed_smile_render_status.tsv"
+if [[ -n "${CANDIDATE_RANKS}" || -n "${GAINS:-}" ]]; then
+  REPORT="${REPORT:-${OUTPUT_DIR}/closed_smile_shortlist_report.md}"
+  GRID="${GRID:-${OUTPUT_DIR}/closed_smile_shortlist_grid.png}"
+  MANIFEST="${MANIFEST:-${OUTPUT_DIR}/closed_smile_shortlist_manifest.json}"
+  RENDER_STATUS="${RENDER_STATUS:-${OUTPUT_DIR}/closed_smile_shortlist_render_status.tsv}"
+else
+  REPORT="${REPORT:-${OUTPUT_DIR}/closed_smile_ablation_report.md}"
+  GRID="${GRID:-${OUTPUT_DIR}/closed_smile_ablation_grid.png}"
+  MANIFEST="${MANIFEST:-${OUTPUT_DIR}/closed_smile_ablation_manifest.json}"
+  RENDER_STATUS="${RENDER_STATUS:-${OUTPUT_DIR}/closed_smile_render_status.tsv}"
+fi
 
 mkdir -p "${OUTPUT_DIR}" "${NPZ_DIR}" "${FRAME_DIR}" "${VIDEO_DIR}"
+rm -f "${GRID}"
 
 printf '[ClosedSmileAblation] cwd=%s\n' "$(pwd)"
 printf '[ClosedSmileAblation] output_dir=%s\n' "${OUTPUT_DIR}"
 printf '[ClosedSmileAblation] source_dir=%s\n' "${SOURCE_DIR}"
 printf '[ClosedSmileAblation] expr_gains=%s\n' "${EXPR_GAINS}"
 printf '[ClosedSmileAblation] jaw_modes=%s\n' "${JAW_MODES}"
+printf '[ClosedSmileAblation] candidate_ranks=%s\n' "${CANDIDATE_RANKS:-all}"
 printf '[ClosedSmileAblation] render=%s inference_n_frames=%s max_single_frame_render=%s cuda=%s\n' \
   "${RENDER}" "${INFERENCE_N_FRAMES}" "${MAX_SINGLE_FRAME_RENDER}" "${CUDA_VISIBLE_DEVICES_VALUE}"
 
@@ -62,7 +76,7 @@ for rel in "${required[@]}"; do
   fi
 done
 
-python - "${SOURCE_DIR}" "${NPZ_DIR}" "${MANIFEST}" "${EXPR_GAINS}" "${JAW_MODES}" "${LIMIT_COMBOS}" <<'PY'
+python - "${SOURCE_DIR}" "${NPZ_DIR}" "${MANIFEST}" "${EXPR_GAINS}" "${JAW_MODES}" "${LIMIT_COMBOS}" "${CANDIDATE_RANKS}" <<'PY'
 import json
 import re
 import sys
@@ -76,11 +90,14 @@ manifest_path = Path(sys.argv[3])
 expr_gains = [float(x) for x in sys.argv[4].split()]
 jaw_modes = sys.argv[5].split()
 limit = int(sys.argv[6])
+candidate_ranks_arg = sys.argv[7].split()
+candidate_ranks = {rank.zfill(2) for rank in candidate_ranks_arg}
 
 npz_dir.mkdir(parents=True, exist_ok=True)
 
 candidates = [
     {
+        "rank": "01",
         "label": "rank01_closed_subtle",
         "source": "clean_smile_candidate_01_CELEBVTEXT_3KlGlvQ7Jzg_3_0.npz",
         "sample_id": "CELEBVTEXT_3KlGlvQ7Jzg_3_0",
@@ -88,6 +105,7 @@ candidates = [
         "prior_visual": "subtle closed-mouth smile; best rule score but weaker than rank3",
     },
     {
+        "rank": "04",
         "label": "rank04_cheerful_closed",
         "source": "clean_smile_candidate_04_CELEBVTEXT_fy2SVmBBK5U_1_0.npz",
         "sample_id": "CELEBVTEXT_fy2SVmBBK5U_1_0",
@@ -95,6 +113,7 @@ candidates = [
         "prior_visual": "consistent cheerful expression with low jaw",
     },
     {
+        "rank": "05",
         "label": "rank05_soft_smile",
         "source": "clean_smile_candidate_05_CELEBVHQ_83qspDarezc_8_0.npz",
         "sample_id": "CELEBVHQ_83qspDarezc_8_0",
@@ -102,6 +121,7 @@ candidates = [
         "prior_visual": "weak but natural candidate",
     },
     {
+        "rank": "08",
         "label": "rank08_gentle_dimple",
         "source": "clean_smile_candidate_08_CELEBVHQ_rLY0ubQwxes_26_0.npz",
         "sample_id": "CELEBVHQ_rLY0ubQwxes_26_0",
@@ -109,6 +129,7 @@ candidates = [
         "prior_visual": "gentle dimple/left cheek candidate",
     },
     {
+        "rank": "10",
         "label": "rank10_wide_closed",
         "source": "clean_smile_candidate_10_CELEBVTEXT_NDmnK5fgpH8_18_0.npz",
         "sample_id": "CELEBVTEXT_NDmnK5fgpH8_18_0",
@@ -116,6 +137,7 @@ candidates = [
         "prior_visual": "wide-smile text but low jaw metrics",
     },
     {
+        "rank": "12",
         "label": "rank12_low_jaw_subtle",
         "source": "clean_smile_candidate_12_CELEBVTEXT_iW3OkJWMz6I_24_0.npz",
         "sample_id": "CELEBVTEXT_iW3OkJWMz6I_24_0",
@@ -123,6 +145,7 @@ candidates = [
         "prior_visual": "lowest jaw candidate; may be weak",
     },
     {
+        "rank": "03",
         "label": "rank03_negative_forced_grin",
         "source": "clean_smile_candidate_03_CELEBVHQ__0tf2n3rlJU_0.npz",
         "sample_id": "CELEBVHQ__0tf2n3rlJU_0",
@@ -130,6 +153,13 @@ candidates = [
         "prior_visual": "user rejected: exposed teeth / forced grin / open teeth smile",
     },
 ]
+
+if candidate_ranks:
+    selected = [cand for cand in candidates if cand["rank"] in candidate_ranks]
+    missing = sorted(candidate_ranks - {cand["rank"] for cand in selected})
+    if missing:
+        raise SystemExit(f"unknown CANDIDATE_RANKS: {','.join(missing)}")
+    candidates = selected
 
 
 def load_motion(path: Path) -> np.ndarray:
@@ -215,10 +245,13 @@ payload = {
     "output_dir": str(manifest_path.parent),
     "expr_gains": expr_gains,
     "jaw_modes": jaw_modes,
+    "candidate_ranks": sorted(candidate_ranks) if candidate_ranks else "all",
     "limit_combos": limit,
     "total_combos": len(items),
     "items": items,
 }
+if not items:
+    raise SystemExit("no ablation items generated")
 manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 for item in items:
     print(f"{item['case_name']}|{item['motion_npz']}")
@@ -315,10 +348,12 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+manifest_path = Path(sys.argv[1])
+manifest = json.load(open(manifest_path, encoding="utf-8"))
 report = Path(sys.argv[2])
 grid = Path(sys.argv[3])
 render_status_path = Path(sys.argv[4])
+is_shortlist = "shortlist" in manifest_path.name or manifest.get("candidate_ranks") != "all"
 
 status = {}
 if render_status_path.exists():
@@ -357,16 +392,18 @@ priority.sort(key=lambda x: (
 ))
 best_rule = priority[0] if priority else (closed[0] if closed else items[0])
 
+title = "P7/P8 Closed-Mouth Smile Shortlist" if is_shortlist else "P7/P8 Closed-Mouth Smile Ablation"
 lines = [
-    "# P7/P8 Closed-Mouth Smile Ablation",
+    f"# {title}",
     "",
     f"Output directory: `{report.parent}`",
     f"Grid: `{grid.name}`" if grid.exists() else "Grid: not generated yet (`RENDER=0` or render incomplete)",
-    f"Manifest: `{manifest.get('output_dir', report.parent)}/closed_smile_ablation_manifest.json`",
+    f"Manifest: `{manifest_path}`",
     f"Render status: `{render_status_path}`",
     "",
     "## Setup",
     "",
+    f"- candidate ranks: `{manifest.get('candidate_ranks')}`",
     f"- expr_gain values: `{', '.join(str(x) for x in manifest['expr_gains'])}`",
     f"- jaw_mode values: `{', '.join(manifest['jaw_modes'])}`",
     f"- total combinations: `{manifest['total_combos']}`",
@@ -415,10 +452,21 @@ lines += [
     "- Preferred default smile_gain should come from the weakest natural visible setting, usually `0.8` if visible or `1.0` if `0.8` is too weak.",
     "- Mark combinations with exposed teeth, large mouth opening, lip tightening, or grimace/forced grin after inspecting the grid.",
     "- If rank3 remains unnatural with `jaw_mode=zero`, exclude it from default smile and keep it only as an open_teeth_smile / grin-style control.",
+]
+if is_shortlist:
+    lines += [
+        "",
+        "Shortlist-specific questions:",
+        "- Is `rank01` at `gain0.8/1.0` more visible than `gain0.6` while still natural?",
+        "- Do `rank04`, `rank08`, `rank10`, or `rank12` produce a better closed-mouth smile?",
+        "- Does `rank03` remain exposed-teeth / forced-grin with `jaw_mode=zero`?",
+        "- Which top 2 candidates should enter the second round?",
+    ]
+lines += [
     "",
     "## Manual Visual Review",
     "",
-    "- TODO inspect `closed_smile_ablation_grid.png` and videos.",
+    f"- TODO inspect `{grid.name}` and videos.",
     "- Which candidate + expr_gain + jaw_mode is most natural: TODO.",
     "- Which combinations expose teeth / look strange / look like grimace: TODO.",
     "- rank3 with jaw zero verdict: TODO.",
